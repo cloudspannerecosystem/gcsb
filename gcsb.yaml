@@ -1,0 +1,111 @@
+# Copyright 2022 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# GCP Project ID
+project:  gcsb-324823
+
+# Spanner Instance ID
+instance: nearby-test
+
+# Spanner Database Name
+database: nearby-test
+
+# Number of threads (goroutines) used to generate load
+threads: 50
+
+# Number of GCP connections to establish to spanner
+# 
+# This value is the number of TCP connections that are established to the database.
+# This value should not be set artificially high. It's default value is the number of CPU threads 
+# available at runtime. 
+# Please note, the database driver will block until all TCP connections are established. If this 
+# value is very high, that will take quite some time before the load test can proceed. 
+num_conns: 30
+
+# Spanner Connection Pool Settings
+pool:
+  # MaxOpened is the maximum number of opened sessions allowed by the session pool
+  max_opened: 1000
+  # MinOpened is the minimum number of opened sessions that the session pool tries to maintain
+  min_opened: 100
+  # MaxIdle is the maximum number of idle sessions that are allowed in the session pool
+  max_idle: 0
+  # WriteSessions is the fraction of sessions we try to keep prepared for write
+  write_sessions: 0.2
+  # HealthCheckWorkers is number of workers used by health checker for this pool
+  healthcheck_workers: 10
+  # HealthCheckInterval is how often the health checker pings a session
+  # Values such as "300ms", "-1.5h" or "2h45m". Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
+  healthcheck_interval: 50m
+  # TrackSessionHandles determines whether the session pool will keep track
+  # of the stacktrace of the goroutines that take sessions from the pool
+  track_session_handles: false
+
+# Maximum execution time. If set, we will run until we hit operation count, or this time limit. Whichever comes first.
+# When set to 0, run indefinitely. Example: "1h" = 1 hour
+# # Values such as "300ms", "-1.5h" or "2h45m". Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
+max_execution_time: 0
+
+batch: true
+batch_size: 5
+
+operations: 
+  # Total number of operations
+  total: 5000
+  # Read operation weight
+  read: 100
+  # Write operation weight 
+  write: 0
+  # The percentage of rows to sample for generating read operations
+  sample_size: 10
+  # Perform stale read operations. Default: false (meaning perform strong reads)
+  read_stale: false
+  # If read_stale is true, use exact staleness time duration for read operations
+  # See: https://cloud.google.com/spanner/docs/reads#perform-stale-read
+  # Values such as "300ms", "-1.5h" or "2h45m". Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
+  staleness: 15s
+  # If a table has a composite primary key [Example: (UserID, FirstName)], we will generate point reads
+  # for both columns making up the key. When this value is 'true', we will only generate values for the 
+  # first column of the key.
+  # # NOT CURRENTLY SUPPORTED
+  partial_keys: true
+
+# If table exists, we will detect the column types of the table and use DEFAULT data generators
+# Here is where you can override those generators
+tables:
+  - name: SingleSingersNoArray
+    columns:
+      - name: FirstName
+        generator:
+          length: 10
+      - name: LastName
+        generator:
+          length: 10
+      - name: ByteField
+        generator:
+          length: 10
+  - name: SingleSingers
+    columns:
+      - name: FirstName
+        generator:
+          length: 10
+          range:
+            begin: AAA
+            end: ZZZ
+      - name: LastName
+        generator:
+          length: 10
+      - name: ByteField
+        generator:
+          length: 10
