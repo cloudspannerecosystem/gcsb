@@ -8,11 +8,11 @@
   - [Operations](#operations)
     - [Load](#load)
       - [Single table load](#single-table-load)
-      - [Mulitiple table load](#mulitiple-table-load)
+      - [Multiple table load](#multiple-table-load)
       - [Loading into interleaved tables](#loading-into-interleaved-tables)
     - [Run](#run)
       - [Single table run](#single-table-run)
-      - [Mulitiple table run](#mulitiple-table-run)
+      - [Multiple table run](#multiple-table-run)
       - [Running against interleaved tables](#running-against-interleaved-tables)
   - [Distributed testing](#distributed-testing)
   - [Configuration](#configuration)
@@ -77,7 +77,7 @@ gcsb load -t TABLE_NAME -o NUM_ROWS
 
 Additionally, please see `gcsb load --help` for additional configuration options.
 
-#### Mulitiple table load
+#### Multiple table load
 
 Similar to the above [Single table load](#single-table-load), you may specify multiple tables by repeating the `-t TABLE_NAME` argument. By default, the number of operations is applied to each table. For example, specifying 2 tables with 1000 operations, will yield 2000 total operations. 1000 per table.
 
@@ -145,7 +145,7 @@ gcsb run -p YOUR_GCP_PROJECT_ID -i YOUR_INSTANCE_ID -d YOUR_DATABASE_ID -t Singl
 
 Additionally, please see `gcsb run --help` for additional configuration options.
 
-#### Mulitiple table run
+#### Multiple table run
 
 Similar to the above [Single table run](#single-table-run), you may specify multiple tables by repeating the `-t TABLE_NAME` argument. By default, the number of operations is applied to each table. For example, specifying 2 tables with 1000 operations, will yield 2000 total operations. 1000 per table.
 
@@ -200,16 +200,13 @@ For in depth information on the various configuration values, please read the co
 
 - [ ] Generating read operations utilizing [ReadByIndex](https://cloud.google.com/spanner/docs/samples/spanner-read-data-with-index#spanner_read_data_with_index-go)
 - [ ] Generating NULL values for load operations. If a column is NULLable, gcsb will still generate a value for it.
-- [x] ~~JSON column types~~
+- [ ] JSON column types
 - [ ] STRUCT Objects.
-- [ ] VIEWS issue #26 is WIP to support 100% READ tests against views but is not currently functioning
-- [x] ~~INTERLEAVE tables. Support for INTERLEAVE is currently WIP, and it will only support apex test targets~~
-  - [ ] INTERLEAVE talbes are now supported for both LOAD and RUN. RUN operations only support the table at the APEX of the hierarchy
+- [ ] VIEWS
 - [ ] Inserting data across multiple tables in the same transaction
 - [ ] No SCAN or DELETE operations are supported at this time
 - [ ] Tables with foreign key relationships
 - [ ] Testing multiple tables at once
-- [x] ~~Tables containing columns with `allow_commit_timestamp=TRUE`~~
 
 ## Development
 
