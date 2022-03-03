@@ -26,8 +26,6 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
-	"github.com/olekukonko/tablewriter"
-	"github.com/rcrowley/go-metrics"
 	"github.com/cloudspannerecosystem/gcsb/pkg/config"
 	"github.com/cloudspannerecosystem/gcsb/pkg/generator"
 	"github.com/cloudspannerecosystem/gcsb/pkg/generator/data"
@@ -36,6 +34,8 @@ import (
 	"github.com/cloudspannerecosystem/gcsb/pkg/generator/selector"
 	"github.com/cloudspannerecosystem/gcsb/pkg/schema"
 	"github.com/cloudspannerecosystem/gcsb/pkg/workload/pool"
+	"github.com/olekukonko/tablewriter"
+	"github.com/rcrowley/go-metrics"
 )
 
 var (
@@ -489,9 +489,7 @@ func (c *CoreWorkload) bucketOps(n int, k int) []int {
 		if o > 0 {
 			r[i] = e + 1
 			o--
-		}
-
-		if o == 0 {
+		} else {
 			r[i] = e
 		}
 	}
