@@ -41,9 +41,21 @@ func TestNewUUIDV4Generator(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			desc:    "STRING(40) should be valid",
+			colType: spansql.String,
+			colLen:  40,
+			wantErr: false,
+		},
+		{
 			desc:    "BYTES(16) should be valid",
 			colType: spansql.Bytes,
 			colLen:  16,
+			wantErr: false,
+		},
+		{
+			desc:    "BYTES(32) should be valid",
+			colType: spansql.Bytes,
+			colLen:  32,
 			wantErr: false,
 		},
 		{
@@ -87,6 +99,15 @@ func TestUUIDV4GeneratorNext(t *testing.T) {
 			wantLen:  36,
 		},
 		{
+			desc: "UUID for STRING(40)",
+			generator: &UUIDV4Generator{
+				colType:   spansql.String,
+				colLength: 40,
+			},
+			wantType: "string",
+			wantLen:  36,
+		},
+		{
 			desc: "UUID for STRING(32)",
 			generator: &UUIDV4Generator{
 				colType:   spansql.String,
@@ -100,6 +121,15 @@ func TestUUIDV4GeneratorNext(t *testing.T) {
 			generator: &UUIDV4Generator{
 				colType:   spansql.Bytes,
 				colLength: 16,
+			},
+			wantType: "[]uint8",
+			wantLen:  16,
+		},
+		{
+			desc: "UUID for BYTES(32)",
+			generator: &UUIDV4Generator{
+				colType:   spansql.Bytes,
+				colLength: 32,
 			},
 			wantType: "[]uint8",
 			wantLen:  16,

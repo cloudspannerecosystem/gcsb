@@ -42,12 +42,12 @@ func NewUUIDV4Generator(colType spansql.TypeBase, colLength int64) (Generator, e
 	// Validate column.
 	switch colType {
 	case spansql.String:
-		if colLength != uuidV4LenString && colLength != uuidV4LenStringWithoutSeparator {
+		if colLength < uuidV4LenStringWithoutSeparator {
 			return nil, fmt.Errorf("invalid column length for string UUID: %d", colLength)
 		}
 	case spansql.Bytes:
-		if colLength != uuidV4LenBytes {
-			return nil, fmt.Errorf("invalid column length for string UUID: %d", colLength)
+		if colLength < uuidV4LenBytes {
+			return nil, fmt.Errorf("invalid column length for bytes UUID: %d", colLength)
 		}
 	default:
 		return nil, fmt.Errorf("invalid column type for UUID: %v", colType.SQL())
@@ -72,7 +72,7 @@ func (g *UUIDV4Generator) Next() interface{} {
 		return b
 	}
 
-	if g.colLength == uuidV4LenStringWithoutSeparator {
+	if g.colLength >= uuidV4LenStringWithoutSeparator && g.colLength < uuidV4LenString {
 		// Returns UUID without separators "-".
 		return strings.Join(strings.Split(id.String(), "-"), "")
 	}
