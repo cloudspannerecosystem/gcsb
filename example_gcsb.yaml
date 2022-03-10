@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # GCP Project ID
-project:  YOUR_PROJECT_ID
+project: YOUR_PROJECT_ID
 
 # Spanner Instance ID
 instance: YOUR_SPANNER_INSTANCE_ID
@@ -51,7 +51,7 @@ pool:
 # NOT CURRENTLY SUPPORTED
 max_execution_time: 1h
 
-operations: 
+operations:
   # Total number of operations
   total: 5000
   # Read operation weight
@@ -77,6 +77,9 @@ operations:
 tables:
   - name: SingleSingers
     columns:
+      - name: SingerId
+        generator:
+          type: UUID_V4
       - name: FirstName
         generator:
           length: 10
