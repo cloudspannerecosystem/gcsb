@@ -194,6 +194,14 @@ Please note, at present, the yaml conifguration file is the only way to specify 
 
 For in depth information on the various configuration values, please read the comments in [example_gcsb.yaml](example_gcsb.yaml)
 
+### Supported generator type
+
+The tool supports the following generator type in the configuration.
+
+| type | description |
+|------|-------------|
+| `UUID_V4` | Generates UUID v4 value. Supported column types are `STRING` and `BYTES`. Note that UUID is automatically inferred for `STRING(36)` column without a configuration. |
+
 ## Roadmap
 
 ### Not Supported (yet)

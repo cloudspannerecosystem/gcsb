@@ -25,6 +25,11 @@ import (
 	"github.com/cloudspannerecosystem/gcsb/pkg/schema"
 )
 
+const (
+	uuidV4Length        = 36
+	generatorTypeUUIDV4 = "UUID_V4"
+)
+
 // TODO: Handle static value generator (table samples)
 // TODO: Handle random string generator vs ranged string generation
 
@@ -126,6 +131,10 @@ func GetConfiguredGenerator(t spansql.Type, col *config.Column) (data.Generator,
 		cfg.SetLength(*col.Generator.Length)
 	}
 
+	if col.Generator.Type != nil && *col.Generator.Type == generatorTypeUUIDV4 {
+		return data.NewUUIDV4Generator(t.Base, t.Len)
+	}
+
 	// If there are multiple ranges, assemble a sub range generator that
 	// contains a generator per range config
 	if len(col.Generator.Range) > 1 {
@@ -195,6 +204,12 @@ func GetDefaultGeneratorForType(t spansql.Type, cfg data.Config) (data.Generator
 	case spansql.Bool:
 		g, err = data.NewBooleanGenerator(cfg)
 	case spansql.String:
+		// Infer UUID v4 pattern from the column length.
+		if t.Len == uuidV4Length {
+			g, err = data.NewUUIDV4Generator(t.Base, t.Len)
+			break
+		}
+
 		// TODO: Check if config indicates we should do random string generator or hexvigesimal
 
 		// Config for generator has no length specified. Take the columns length
