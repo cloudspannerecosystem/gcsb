@@ -99,39 +99,7 @@ tables:
 
 #### Loading into interleaved tables
 
-Loading data into interleaved tables is supported but has some behavioral side effects that should be known. When loading data into an interleaved table, GCSB will detect all tables in the hierarchy and begin loading data at the familial apex. The configured number of operations applies to this apex table. By default, the number of tables for each child table is multiplied by 5. For example:
-
-Using our [test INTERLEAVE schema](schemas/multi_table.sql), we see an INTERLEAVE relationship between the `Singers`, `Albums`, and `Songs` tables.
-
-If we execute a load operation against these tables with total operations set to `10` we will see the following occur
-
-```sh
-gcsb load -t Songs -o 10
-
-+---------+------------+------+-------+---------+
-|  TABLE  | OPERATIONS | READ | WRITE | CONTEXT |
-+---------+------------+------+-------+---------+
-| Singers |         10 | N/A  | N/A   | LOAD    |
-| Albums  |         50 | N/A  | N/A   | LOAD    |
-| Songs   |        250 | N/A  | N/A   | LOAD    |
-+---------+------------+------+-------+---------+
-```
-
-In this case, for each child table we take the number of operations for the parent and multiply it by the default value of `5`.
-
-To change this multiplier, we use the yaml configuration file for the table we want. The `operations.total` value becomes a multiplier. 
-
-```yaml
-tables:
-  - name: Albums
-    operations:
-      total: 10
-  - name: Songs
-    operations:
-      total: 20
-```
-
-At present, GCSB will sort it's operations from the apex down. Meaning it will populate the `Singers` table first and then it's child, and then the next child. Multiple table operations are not mixed within the same transaction. 
+Loading data into interleaved tables is not supported yet. If you want to create splits in the database, you can load data into parent tables.
 
 ### Run
 
@@ -206,6 +174,7 @@ The tool supports the following generator type in the configuration.
 
 ### Not Supported (yet)
 
+- [ ] Interleaved tables for Load and Run phases.
 - [ ] Generating read operations utilizing [ReadByIndex](https://cloud.google.com/spanner/docs/samples/spanner-read-data-with-index#spanner_read_data_with_index-go)
 - [ ] Generating NULL values for load operations. If a column is NULLable, gcsb will still generate a value for it.
 - [ ] JSON column types
