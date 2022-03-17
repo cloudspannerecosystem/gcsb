@@ -20,7 +20,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -136,13 +135,17 @@ func (c *CoreWorkload) Initialize() error {
 
 // Plan will create *Targets for each TargetName
 func (c *CoreWorkload) Plan(pt JobType, targets []string) error {
-	var isInterleaved bool
+	var needOperationMultiplication bool
 	apexTables := make([]schema.Table, 0)
 
 	// search func for looking if targets contains the given string
-	contains := func(s []string, searchterm string) bool {
-		i := sort.SearchStrings(s, searchterm)
-		return i < len(s) && s[i] == searchterm
+	contains := func(items []string, searchterm string) bool {
+		for _, item := range items {
+			if item == searchterm {
+				return true
+			}
+		}
+		return false
 	}
 
 	// We can only run against one table at a time, so only expand interleaved tables if we are loading
@@ -155,7 +158,8 @@ func (c *CoreWorkload) Plan(pt JobType, targets []string) error {
 			}
 
 			// If the table is interleaved, find it's entire lineage and add it to the target list
-			if st.IsInterleaved() {
+			if st.IsInterleaved() && !st.IsApex() {
+				needOperationMultiplication = true // Used below
 				relatives := st.GetAllRelationNames()
 				for _, n := range relatives {
 					if n == t { // Avoid inserting t twice for some reason... i dont have time to figure out why this is happenign
@@ -177,11 +181,8 @@ func (c *CoreWorkload) Plan(pt JobType, targets []string) error {
 			return fmt.Errorf("table '%s' missing from information schema", t)
 		}
 
-		if st.IsInterleaved() {
-			isInterleaved = true // Used below
-			if st.IsApex() {
-				apexTables = append(apexTables, st) // Collect a slice of apex tables
-			}
+		if st.IsInterleaved() && st.IsApex() {
+			apexTables = append(apexTables, st) // Collect a slice of apex tables
 		}
 
 		// Create target
@@ -271,7 +272,7 @@ func (c *CoreWorkload) Plan(pt JobType, targets []string) error {
 	}
 
 	// So if our phase is load, the operations per target are actually multipliers. Now we go through and do that multiplication
-	if pt == JobLoad && isInterleaved {
+	if pt == JobLoad && needOperationMultiplication {
 		for _, at := range apexTables {
 			apexTarget := FindTargetByName(c.plan, at.Name())
 
