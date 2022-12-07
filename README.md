@@ -43,7 +43,7 @@ gcloud spanner databases ddl update YOUR_DATABASE_ID --instance=YOUR_INSTANCE_ID
 
 ### Load data into table
 
-Load some data into the table to seed the upcoming laod test. In the example below, we are loading 10,000 rows of random data into the table `SingleSingers`
+Load some data into the table to seed the upcoming load test. In the example below, we are loading 10,000 rows of random data into the table `SingleSingers`
 
 ```sh
 gcsb load -p YOUR_GCP_PROJECT_ID -i YOUR_INSTANCE_ID -d YOUR_DATABASE_ID -t SingleSingers -o 10000
