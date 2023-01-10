@@ -34,16 +34,6 @@ func TestColumn(t *testing.T) {
 				So(x.Base, ShouldEqual, spansql.Bool)
 			})
 
-			Convey("String", func() {
-				c := NewColumn()
-				c.SetSpannerType("STRING")
-
-				x := c.Type()
-				So(x, ShouldNotBeNil)
-				So(x.Array, ShouldBeFalse)
-				So(x.Base, ShouldEqual, spansql.String)
-			})
-
 			Convey("String(1024)", func() {
 				c := NewColumn()
 				c.SetSpannerType("STRING(1024)")
@@ -116,9 +106,19 @@ func TestColumn(t *testing.T) {
 				So(x.Base, ShouldEqual, spansql.Date)
 			})
 
-			Convey("ARRAY<STRING>", func() {
+			Convey("ARRAY<STRING(1024)>", func() {
 				c := NewColumn()
-				c.SetSpannerType("ARRAY<STRING>")
+				c.SetSpannerType("ARRAY<STRING(1024)>")
+
+				x := c.Type()
+				So(x, ShouldNotBeNil)
+				So(x.Array, ShouldBeTrue)
+				So(x.Base, ShouldEqual, spansql.String)
+			})
+
+			Convey("ARRAY<STRING(MAX)>", func() {
+				c := NewColumn()
+				c.SetSpannerType("ARRAY<STRING(MAX)>")
 
 				x := c.Type()
 				So(x, ShouldNotBeNil)

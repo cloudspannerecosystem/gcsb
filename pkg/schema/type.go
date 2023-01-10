@@ -36,6 +36,11 @@ func ParseSpannerType(spannerType string) spansql.Type {
 
 	dt := spannerType
 
+	if strings.HasPrefix(dt, "ARRAY<") {
+		ret.Array = true
+		dt = strings.TrimSuffix(strings.TrimPrefix(dt, "ARRAY<"), ">")
+	}
+
 	// separate type and length from dt with length such as STRING(32) or BYTES(256)
 	m := lengthRegexp.FindStringSubmatchIndex(dt)
 	if m != nil {
@@ -52,11 +57,6 @@ func ParseSpannerType(spannerType string) spansql.Type {
 
 		// trim length from dt
 		dt = dt[:m[0]] + dt[m[1]:]
-	}
-
-	if strings.HasPrefix(dt, "ARRAY<") {
-		ret.Array = true
-		dt = strings.TrimSuffix(strings.TrimPrefix(dt, "ARRAY<"), ">")
 	}
 
 	ret.Base = parseType(dt)
