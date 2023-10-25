@@ -21,12 +21,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"strings"
 
-	"google.golang.org/grpc/balancer/roundrobin"
 	internalserviceconfig "google.golang.org/grpc/internal/serviceconfig"
 	"google.golang.org/grpc/serviceconfig"
-	"google.golang.org/grpc/xds/internal/balancer/ringhash"
+	"google.golang.org/grpc/xds/internal/balancer/outlierdetection"
+	"google.golang.org/grpc/xds/internal/xdsclient/bootstrap"
 )
 
 // DiscoveryMechanismType is the type of discovery mechanism.
@@ -84,11 +83,9 @@ func (t *DiscoveryMechanismType) UnmarshalJSON(b []byte) error {
 type DiscoveryMechanism struct {
 	// Cluster is the cluster name.
 	Cluster string `json:"cluster,omitempty"`
-	// LoadReportingServerName is the LRS server to send load reports to. If
-	// not present, load reporting will be disabled. If set to the empty string,
-	// load reporting will be sent to the same server that we obtained CDS data
-	// from.
-	LoadReportingServerName *string `json:"lrsLoadReportingServerName,omitempty"`
+	// LoadReportingServer is the LRS server to send load reports to. If not
+	// present, load reporting will be disabled.
+	LoadReportingServer *bootstrap.ServerConfig `json:"lrsLoadReportingServer,omitempty"`
 	// MaxConcurrentRequests is the maximum number of outstanding requests can
 	// be made to the upstream cluster. Default is 1024.
 	MaxConcurrentRequests *uint32 `json:"maxConcurrentRequests,omitempty"`
@@ -103,14 +100,17 @@ type DiscoveryMechanism struct {
 	// DNSHostname is the DNS name to resolve in "host:port" form. For type
 	// LOGICAL_DNS only.
 	DNSHostname string `json:"dnsHostname,omitempty"`
+	// OutlierDetection is the Outlier Detection LB configuration for this
+	// priority.
+	OutlierDetection json.RawMessage `json:"outlierDetection,omitempty"`
+	outlierDetection outlierdetection.LBConfig
 }
 
 // Equal returns whether the DiscoveryMechanism is the same with the parameter.
 func (dm DiscoveryMechanism) Equal(b DiscoveryMechanism) bool {
+	od := &dm.outlierDetection
 	switch {
 	case dm.Cluster != b.Cluster:
-		return false
-	case !equalStringP(dm.LoadReportingServerName, b.LoadReportingServerName):
 		return false
 	case !equalUint32P(dm.MaxConcurrentRequests, b.MaxConcurrentRequests):
 		return false
@@ -120,18 +120,17 @@ func (dm DiscoveryMechanism) Equal(b DiscoveryMechanism) bool {
 		return false
 	case dm.DNSHostname != b.DNSHostname:
 		return false
-	}
-	return true
-}
-
-func equalStringP(a, b *string) bool {
-	if a == nil && b == nil {
-		return true
-	}
-	if a == nil || b == nil {
+	case !od.EqualIgnoringChildPolicy(&b.outlierDetection):
 		return false
 	}
-	return *a == *b
+
+	if dm.LoadReportingServer == nil && b.LoadReportingServer == nil {
+		return true
+	}
+	if (dm.LoadReportingServer != nil) != (b.LoadReportingServer != nil) {
+		return false
+	}
+	return dm.LoadReportingServer.String() == b.LoadReportingServer.String()
 }
 
 func equalUint32P(a, b *uint32) bool {
@@ -154,32 +153,6 @@ type LBConfig struct {
 	DiscoveryMechanisms []DiscoveryMechanism `json:"discoveryMechanisms,omitempty"`
 
 	// XDSLBPolicy specifies the policy for locality picking and endpoint picking.
-	//
-	// Note that it's not normal balancing policy, and it can only be either
-	// ROUND_ROBIN or RING_HASH.
-	//
-	// For ROUND_ROBIN, the policy name will be "ROUND_ROBIN", and the config
-	// will be empty. This sets the locality-picking policy to weighted_target
-	// and the endpoint-picking policy to round_robin.
-	//
-	// For RING_HASH, the policy name will be "RING_HASH", and the config will
-	// be lb config for the ring_hash_experimental LB Policy. ring_hash policy
-	// is responsible for both locality picking and endpoint picking.
-	XDSLBPolicy *internalserviceconfig.BalancerConfig `json:"xdsLbPolicy,omitempty"`
-}
-
-const (
-	rrName = roundrobin.Name
-	rhName = ringhash.Name
-)
-
-func parseConfig(c json.RawMessage) (*LBConfig, error) {
-	var cfg LBConfig
-	if err := json.Unmarshal(c, &cfg); err != nil {
-		return nil, err
-	}
-	if lbp := cfg.XDSLBPolicy; lbp != nil && !strings.EqualFold(lbp.Name, rrName) && !strings.EqualFold(lbp.Name, rhName) {
-		return nil, fmt.Errorf("unsupported child policy with name %q, not one of {%q,%q}", lbp.Name, rrName, rhName)
-	}
-	return &cfg, nil
+	XDSLBPolicy json.RawMessage `json:"xdsLbPolicy,omitempty"`
+	xdsLBPolicy internalserviceconfig.BalancerConfig
 }
