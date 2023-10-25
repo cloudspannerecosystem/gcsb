@@ -23,8 +23,12 @@ import (
 	"log"
 	"time"
 
+	"cloud.google.com/go/internal/trace"
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/golang/protobuf/proto"
-	sppb "google.golang.org/genproto/googleapis/spanner/v1"
+	"github.com/googleapis/gax-go/v2"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 // BatchReadOnlyTransaction is a ReadOnlyTransaction that allows for exporting
@@ -100,13 +104,13 @@ func (t *BatchReadOnlyTransaction) PartitionRead(ctx context.Context, table stri
 // can be configured using PartitionOptions. Pass a ReadOptions to modify the
 // read operation.
 func (t *BatchReadOnlyTransaction) PartitionReadWithOptions(ctx context.Context, table string, keys KeySet, columns []string, opt PartitionOptions, readOptions ReadOptions) ([]*Partition, error) {
-	return t.PartitionReadUsingIndexWithOptions(ctx, table, "", keys, columns, opt, readOptions)
+	return t.PartitionReadUsingIndexWithOptions(ctx, table, "", keys, columns, opt, t.ReadOnlyTransaction.txReadOnly.ro.merge(readOptions))
 }
 
 // PartitionReadUsingIndex returns a list of Partitions that can be used to read
 // rows from the database using an index.
 func (t *BatchReadOnlyTransaction) PartitionReadUsingIndex(ctx context.Context, table, index string, keys KeySet, columns []string, opt PartitionOptions) ([]*Partition, error) {
-	return t.PartitionReadUsingIndexWithOptions(ctx, table, index, keys, columns, opt, ReadOptions{})
+	return t.PartitionReadUsingIndexWithOptions(ctx, table, index, keys, columns, opt, t.ReadOnlyTransaction.txReadOnly.ro)
 }
 
 // PartitionReadUsingIndexWithOptions returns a list of Partitions that can be
@@ -128,7 +132,8 @@ func (t *BatchReadOnlyTransaction) PartitionReadUsingIndexWithOptions(ctx contex
 	if err != nil {
 		return nil, err
 	}
-	resp, err = client.PartitionRead(contextWithOutgoingMetadata(ctx, sh.getMetadata()), &sppb.PartitionReadRequest{
+	var md metadata.MD
+	resp, err = client.PartitionRead(contextWithOutgoingMetadata(ctx, sh.getMetadata(), t.disableRouteToLeader), &sppb.PartitionReadRequest{
 		Session:          sid,
 		Transaction:      ts,
 		Table:            table,
@@ -136,7 +141,13 @@ func (t *BatchReadOnlyTransaction) PartitionReadUsingIndexWithOptions(ctx contex
 		Columns:          columns,
 		KeySet:           kset,
 		PartitionOptions: opt.toProto(),
-	})
+	}, gax.WithGRPCOptions(grpc.Header(&md)))
+
+	if getGFELatencyMetricsFlag() && md != nil && t.ct != nil {
+		if err := createContextAndCaptureGFELatencyMetrics(ctx, t.ct, md, "PartitionReadUsingIndexWithOptions"); err != nil {
+			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
+		}
+	}
 	// Prepare ReadRequest.
 	req := &sppb.ReadRequest{
 		Session:        sid,
@@ -180,6 +191,7 @@ func (t *BatchReadOnlyTransaction) partitionQuery(ctx context.Context, statement
 	if err != nil {
 		return nil, err
 	}
+	var md metadata.MD
 
 	// request Partitions
 	req := &sppb.PartitionQueryRequest{
@@ -190,7 +202,13 @@ func (t *BatchReadOnlyTransaction) partitionQuery(ctx context.Context, statement
 		Params:           params,
 		ParamTypes:       paramTypes,
 	}
-	resp, err := client.PartitionQuery(contextWithOutgoingMetadata(ctx, sh.getMetadata()), req)
+	resp, err := client.PartitionQuery(contextWithOutgoingMetadata(ctx, sh.getMetadata(), t.disableRouteToLeader), req, gax.WithGRPCOptions(grpc.Header(&md)))
+
+	if getGFELatencyMetricsFlag() && md != nil && t.ct != nil {
+		if err := createContextAndCaptureGFELatencyMetrics(ctx, t.ct, md, "partitionQuery"); err != nil {
+			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
+		}
+	}
 
 	// prepare ExecuteSqlRequest
 	r := &sppb.ExecuteSqlRequest{
@@ -251,7 +269,16 @@ func (t *BatchReadOnlyTransaction) Cleanup(ctx context.Context) {
 	}
 	t.sh = nil
 	sid, client := sh.getID(), sh.getClient()
-	err := client.DeleteSession(contextWithOutgoingMetadata(ctx, sh.getMetadata()), &sppb.DeleteSessionRequest{Name: sid})
+
+	var md metadata.MD
+	err := client.DeleteSession(contextWithOutgoingMetadata(ctx, sh.getMetadata(), true), &sppb.DeleteSessionRequest{Name: sid}, gax.WithGRPCOptions(grpc.Header(&md)))
+
+	if getGFELatencyMetricsFlag() && md != nil && t.ct != nil {
+		if err := createContextAndCaptureGFELatencyMetrics(ctx, t.ct, md, "Cleanup"); err != nil {
+			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
+		}
+	}
+
 	if err != nil {
 		var logger *log.Logger
 		if sh.session != nil {
@@ -280,7 +307,7 @@ func (t *BatchReadOnlyTransaction) Execute(ctx context.Context, p *Partition) *R
 	// Read or query partition.
 	if p.rreq != nil {
 		rpc = func(ctx context.Context, resumeToken []byte) (streamingReceiver, error) {
-			return client.StreamingRead(ctx, &sppb.ReadRequest{
+			client, err := client.StreamingRead(ctx, &sppb.ReadRequest{
 				Session:        p.rreq.Session,
 				Transaction:    p.rreq.Transaction,
 				Table:          p.rreq.Table,
@@ -291,10 +318,20 @@ func (t *BatchReadOnlyTransaction) Execute(ctx context.Context, p *Partition) *R
 				RequestOptions: p.rreq.RequestOptions,
 				ResumeToken:    resumeToken,
 			})
+			if err != nil {
+				return client, err
+			}
+			md, err := client.Header()
+			if getGFELatencyMetricsFlag() && md != nil && t.ct != nil {
+				if err := createContextAndCaptureGFELatencyMetrics(ctx, t.ct, md, "Execute"); err != nil {
+					trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
+				}
+			}
+			return client, err
 		}
 	} else {
 		rpc = func(ctx context.Context, resumeToken []byte) (streamingReceiver, error) {
-			return client.ExecuteStreamingSql(ctx, &sppb.ExecuteSqlRequest{
+			client, err := client.ExecuteStreamingSql(ctx, &sppb.ExecuteSqlRequest{
 				Session:        p.qreq.Session,
 				Transaction:    p.qreq.Transaction,
 				Sql:            p.qreq.Sql,
@@ -305,10 +342,21 @@ func (t *BatchReadOnlyTransaction) Execute(ctx context.Context, p *Partition) *R
 				RequestOptions: p.qreq.RequestOptions,
 				ResumeToken:    resumeToken,
 			})
+			if err != nil {
+				return client, err
+			}
+			md, err := client.Header()
+
+			if getGFELatencyMetricsFlag() && md != nil && t.ct != nil {
+				if err := createContextAndCaptureGFELatencyMetrics(ctx, t.ct, md, "Execute"); err != nil {
+					trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
+				}
+			}
+			return client, err
 		}
 	}
 	return stream(
-		contextWithOutgoingMetadata(ctx, sh.getMetadata()),
+		contextWithOutgoingMetadata(ctx, sh.getMetadata(), t.disableRouteToLeader),
 		sh.session.logger,
 		rpc,
 		t.setTimestamp,

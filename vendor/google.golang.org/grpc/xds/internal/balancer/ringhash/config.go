@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/serviceconfig"
 )
 
@@ -34,14 +35,21 @@ type LBConfig struct {
 }
 
 const (
-	defaultMinSize = 1024
-	defaultMaxSize = 8 * 1024 * 1024 // 8M
+	defaultMinSize         = 1024
+	defaultMaxSize         = 4096
+	ringHashSizeUpperBound = 8 * 1024 * 1024 // 8M
 )
 
 func parseConfig(c json.RawMessage) (*LBConfig, error) {
 	var cfg LBConfig
 	if err := json.Unmarshal(c, &cfg); err != nil {
 		return nil, err
+	}
+	if cfg.MinRingSize > ringHashSizeUpperBound {
+		return nil, fmt.Errorf("min_ring_size value of %d is greater than max supported value %d for this field", cfg.MinRingSize, ringHashSizeUpperBound)
+	}
+	if cfg.MaxRingSize > ringHashSizeUpperBound {
+		return nil, fmt.Errorf("max_ring_size value of %d is greater than max supported value %d for this field", cfg.MaxRingSize, ringHashSizeUpperBound)
 	}
 	if cfg.MinRingSize == 0 {
 		cfg.MinRingSize = defaultMinSize
@@ -51,6 +59,12 @@ func parseConfig(c json.RawMessage) (*LBConfig, error) {
 	}
 	if cfg.MinRingSize > cfg.MaxRingSize {
 		return nil, fmt.Errorf("min %v is greater than max %v", cfg.MinRingSize, cfg.MaxRingSize)
+	}
+	if cfg.MinRingSize > envconfig.RingHashCap {
+		cfg.MinRingSize = envconfig.RingHashCap
+	}
+	if cfg.MaxRingSize > envconfig.RingHashCap {
+		cfg.MaxRingSize = envconfig.RingHashCap
 	}
 	return &cfg, nil
 }
