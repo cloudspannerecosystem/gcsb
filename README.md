@@ -2,6 +2,7 @@
 
 - [GCSB](#gcsb)
   - [Quickstart](#quickstart)
+    - [Installation](#installation) 
     - [Create a test table](#create-a-test-table)
     - [Load data into table](#load-data-into-table)
     - [Run a load test](#run-a-load-test)
@@ -30,6 +31,14 @@ It's like YCSB but with more Google. A simple tool meant to generate load agains
 - Generate read/write load against user provided schemas
 
 ## Quickstart
+
+### Installation
+ 
+First [install Go](https://go.dev/doc/install) and run the following command to install GCSB:
+
+```sh
+go install github.com/cloudspannerecosystem/gcsb@latest
+```
 
 To initiate a simple load test against your spanner instance using one of our test schemas
 
