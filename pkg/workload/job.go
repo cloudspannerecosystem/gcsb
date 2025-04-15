@@ -20,11 +20,11 @@ import (
 	"time"
 
 	"cloud.google.com/go/spanner"
-	"github.com/rcrowley/go-metrics"
 	"github.com/cloudspannerecosystem/gcsb/pkg/generator/data"
 	"github.com/cloudspannerecosystem/gcsb/pkg/generator/operation"
 	"github.com/cloudspannerecosystem/gcsb/pkg/generator/sample"
 	"github.com/cloudspannerecosystem/gcsb/pkg/generator/selector"
+	"github.com/rcrowley/go-metrics"
 	"google.golang.org/grpc/codes"
 )
 
@@ -35,8 +35,7 @@ type (
 		Client            *spanner.Client   // Spanner Client
 		Table             string            // Table name to execute against
 		Operations        int               // How many operations in this job
-		Batched           bool              // When true, batch $operations mostly used for load
-		BatchSize         int               // Write batch size
+		CommitDelay       time.Duration     // Maximum commit delay for throughput optimization
 		Columns           []string          // Tables column names to ask for during reads
 		StaleReads        bool              // Perform stale reads if true
 		Staleness         time.Duration     // If performing stale reads, use this exact staleness
@@ -72,20 +71,10 @@ const (
 func (j *Job) Execute() {
 	switch j.JobType {
 	case JobLoad: // Load data to table
-		if j.Batched {
-			// Insert $operations in batches
-			err := j.InsertBatch()
-			if err != nil { // If err is returned, it is fatal
-				return
-			}
-		} else {
-			// Insert $operations individually
-			for i := 0; i <= j.Operations; i++ {
-				err := j.InsertOne()
-				if err != nil { // If err is returned, it is fatal
-					return
-				}
-			}
+		// Insert all operations in a single transaction with commit delay
+		err := j.InsertWithCommitDelay()
+		if err != nil { // If err is returned, it is fatal
+			return
 		}
 	case JobRun: // Run against table
 		// Generate $operations reads/writes
@@ -112,6 +101,9 @@ func (j *Job) Execute() {
 }
 
 func (j *Job) ReadOne() error {
+	// Log the commit delay value before starting transaction
+	log.Printf("Benchmark read transaction starting with commit delay: %v", j.CommitDelay)
+
 	// Generate read predicate
 	r := j.generateReadKey()
 
@@ -120,6 +112,9 @@ func (j *Job) ReadOne() error {
 
 	// perform read
 	err := j.readRow(tx, r)
+
+	// Log the commit delay value being used
+	log.Printf("Benchmark read transaction completed with commit delay: %v", j.CommitDelay)
 
 	// Check for fatal errors
 	err = j.checkSpannerError(err)
@@ -131,15 +126,25 @@ func (j *Job) ReadOne() error {
  * InsertOne will insert one row into the jobs table
  */
 func (j *Job) InsertOne() error {
+	// Log the commit delay value before starting transaction
+	log.Printf("Benchmark transaction starting with commit delay: %v", j.CommitDelay)
+
 	// Create a map of row data
 	m := j.generateRow()
 
-	// Insert the row using the mutation API
-	err := j.applyMutations(
+	// Insert the row using the mutation API with commit delay
+	_, err := j.Client.Apply(j.Context,
 		[]*spanner.Mutation{
 			spanner.InsertMap(j.Table, m),
 		},
+		spanner.ApplyCommitOptions(spanner.CommitOptions{
+			MaxCommitDelay:    &j.CommitDelay,
+			ReturnCommitStats: true,
+		}),
 	)
+
+	// Log the commit delay value being used
+	log.Printf("Benchmark transaction completed with commit delay: %v", j.CommitDelay)
 
 	// Check if error is fatal. Since we're only performing 1 op,
 	// This is called mostly for it's side effect of collecting
@@ -149,59 +154,41 @@ func (j *Job) InsertOne() error {
 	return err
 }
 
-/*
- * InsertBatch will insert $operations rows in batches
- */
-func (j *Job) InsertBatch() error {
-	// Determine batchsize
-	bsize := j.BatchSize
-	if bsize == 0 {
-		bsize = DefaultBatchSize
-	}
+func (j *Job) InsertWithCommitDelay() error {
+	// Log the commit delay value before starting transaction
+	log.Printf("Starting transaction with commit delay: %v", j.CommitDelay)
 
-	// Create a buffer for storing mutations
-	buffer := make([]*spanner.Mutation, 0, bsize)
+	// Create a transaction with commit options
+	_, err := j.Client.ReadWriteTransactionWithOptions(j.Context,
+		func(ctx context.Context, txn *spanner.ReadWriteTransaction) error {
+			for i := 1; i <= j.Operations; i++ {
+				// Generate a map for the row data
+				m := j.generateRow()
 
-	for i := 1; i <= j.Operations; i++ {
-		// Generate a map for the row data
-		m := j.generateRow()
-
-		// Insert mutation into buffer
-		buffer = append(buffer, spanner.InsertMap(j.Table, m))
-
-		// If the buffer is >= batch size, flush the buffer
-		if len(buffer) >= bsize {
-			// Insert the row using the mutation API
-			err := j.applyMutations(buffer)
-
-			// Check to see if error is fatal, and halt if it is
-			err = j.checkSpannerError(err)
-			if err != nil {
-				return err
+				// Buffer the mutation in the transaction
+				err := txn.BufferWrite([]*spanner.Mutation{
+					spanner.InsertMap(j.Table, m),
+				})
+				if err != nil {
+					return err
+				}
 			}
+			return nil
+		},
+		spanner.TransactionOptions{
+			CommitOptions: spanner.CommitOptions{
+				MaxCommitDelay:    &j.CommitDelay,
+				ReturnCommitStats: true,
+			},
+		},
+	)
 
-			// clear the buffer
-			buffer = nil
-			buffer = make([]*spanner.Mutation, 0, bsize)
-		}
-	}
+	// Log the commit delay value being used
+	log.Printf("Transaction completed with commit delay: %v", j.CommitDelay)
 
-	// If there is anything left in the buffer, flush it
-	if len(buffer) > 0 {
-		// Insert the row using the mutation API
-		err := j.applyMutations(buffer)
-
-		// Check to see if error is fatal, and halt if it is
-		err = j.checkSpannerError(err)
-		if err != nil {
-			return err
-		}
-
-		// clear the buffer
-		buffer = nil
-	}
-
-	return nil
+	// Check if error is fatal
+	err = j.checkSpannerError(err)
+	return err
 }
 
 // checkSpannerError will return the error if it is fatal,

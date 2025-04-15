@@ -18,13 +18,13 @@ import (
 	"context"
 
 	"cloud.google.com/go/spanner"
-	"github.com/rcrowley/go-metrics"
 	"github.com/cloudspannerecosystem/gcsb/pkg/config"
 	"github.com/cloudspannerecosystem/gcsb/pkg/generator"
 	"github.com/cloudspannerecosystem/gcsb/pkg/generator/data"
 	"github.com/cloudspannerecosystem/gcsb/pkg/generator/sample"
 	"github.com/cloudspannerecosystem/gcsb/pkg/generator/selector"
 	"github.com/cloudspannerecosystem/gcsb/pkg/schema"
+	"github.com/rcrowley/go-metrics"
 )
 
 type Target struct {
@@ -56,8 +56,7 @@ func (t *Target) NewJob() *Job {
 		Columns:                  t.ColumnNames,
 		StaleReads:               t.Config.Operations.ReadStale,
 		Staleness:                t.Config.Operations.Staleness,
-		Batched:                  t.Config.Batch,
-		BatchSize:                t.Config.BatchSize,
+		CommitDelay:              t.Config.CommitDelay,
 		OperationSelector:        t.OperationSelector,
 		WriteGenerator:           t.WriteGenerator,
 		ReadGenerator:            t.ReadGenerator,

@@ -1,0 +1,35 @@
+project: your-project-id
+instance: your-instance-id
+database: your-database-id
+
+# Schema definition
+schema: |
+  CREATE TABLE TestTable (
+    ID STRING(36) NOT NULL,
+    Name STRING(MAX),
+    Value INT64,
+  ) PRIMARY KEY (ID)
+
+# Workload configuration
+workload:
+  threads: 4
+  operations: 1000
+  commitDelay: 100ms # Enable commit delay with 100ms maximum delay
+
+  # Table configuration
+  tables:
+  - name: TestTable
+    writeRatio: 1.0 # 100% writes
+    readRatio: 0.0 # 0% reads
+    rowCount: 1000 # Number of rows to insert
+  # Data generation
+  data:
+  - column: ID
+    type: uuid
+  - column: Name
+    type: string
+    length: 100
+  - column: Value
+    type: int
+    min: 1
+    max: 1000

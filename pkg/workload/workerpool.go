@@ -21,12 +21,12 @@ import (
 	"sync"
 
 	"cloud.google.com/go/spanner"
-	"github.com/rcrowley/go-metrics"
 	"github.com/cloudspannerecosystem/gcsb/pkg/config"
 	"github.com/cloudspannerecosystem/gcsb/pkg/generator"
 	"github.com/cloudspannerecosystem/gcsb/pkg/generator/operation"
 	"github.com/cloudspannerecosystem/gcsb/pkg/schema"
 	"github.com/cloudspannerecosystem/gcsb/pkg/workload/pool"
+	"github.com/rcrowley/go-metrics"
 )
 
 var (
@@ -135,8 +135,7 @@ func (w *WorkerPool) Load(tables []string) error {
 			RowCount:        opsPerJob,
 			Statement:       stmt,
 			GeneratorMap:    genMap,
-			Batch:           true,
-			BatchSize:       5,
+			CommitDelay:     w.Config.CommitDelay,
 			WaitGroup:       &w.wg,
 			MetricsRegistry: w.MetricsRegistry,
 		}

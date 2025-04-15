@@ -1,0 +1,38 @@
+project: YOUR_PROJECT_ID
+instance: test-dual-region-20250404 # This will be updated by the script
+database: testdb-dual-region # This will be updated by the script
+# Schema definition
+schema: |
+  CREATE TABLE TestTable (
+    ID STRING(36) NOT NULL,
+    Name STRING(MAX),
+    Value INT64,
+    CreatedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+    UpdatedAt TIMESTAMP NOT NULL OPTIONS (allow_commit_timestamp=true),
+  ) PRIMARY KEY (ID);
+
+  CREATE INDEX TestTable_Value ON TestTable(Value);
+# Workload configuration
+threads: 10
+operations:
+  total: 1000000 # This will generate ~5GB of data
+  read: 0 # 0% reads
+  write: 100 # 100% writes
+commit_delay: 0ms # Enable commit delay optimization
+# Table configuration
+tables:
+  - name: TestTable
+    writeRatio: 1.0 # 100% writes
+    readRatio: 0.0 # 0% reads
+    rowCount: 1000000 # Number of rows to insert
+# Data generation
+data:
+  - column: ID
+    type: uuid
+  - column: Name
+    type: string
+    length: 1000 # Larger strings to help reach 5GB
+  - column: Value
+    type: int
+    min: 1
+    max: 1000000

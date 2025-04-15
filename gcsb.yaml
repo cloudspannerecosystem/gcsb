@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # GCP Project ID
-project:  gcsb-324823
+project: gcsb-324823
 
 # Spanner Instance ID
 instance: nearby-test
@@ -25,7 +25,7 @@ database: nearby-test
 threads: 50
 
 # Number of GCP connections to establish to spanner
-# 
+#
 # This value is the number of TCP connections that are established to the database.
 # This value should not be set artificially high. It's default value is the number of CPU threads 
 # available at runtime. 
@@ -57,10 +57,10 @@ pool:
 # # Values such as "300ms", "-1.5h" or "2h45m". Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".
 max_execution_time: 0
 
-batch: true
-batch_size: 5
+# Commit delay for throughput optimization (0-500ms)
+commit_delay: 100ms
 
-operations: 
+operations:
   # Total number of operations
   total: 5000
   # Read operation weight
@@ -84,28 +84,28 @@ operations:
 # If table exists, we will detect the column types of the table and use DEFAULT data generators
 # Here is where you can override those generators
 tables:
-  - name: SingleSingersNoArray
-    columns:
-      - name: FirstName
-        generator:
-          length: 10
-      - name: LastName
-        generator:
-          length: 10
-      - name: ByteField
-        generator:
-          length: 10
-  - name: SingleSingers
-    columns:
-      - name: FirstName
-        generator:
-          length: 10
-          range:
-            begin: AAA
-            end: ZZZ
-      - name: LastName
-        generator:
-          length: 10
-      - name: ByteField
-        generator:
-          length: 10
+- name: SingleSingersNoArray
+  columns:
+  - name: FirstName
+    generator:
+      length: 10
+  - name: LastName
+    generator:
+      length: 10
+  - name: ByteField
+    generator:
+      length: 10
+- name: SingleSingers
+  columns:
+  - name: FirstName
+    generator:
+      length: 10
+      range:
+        begin: AAA
+        end: ZZZ
+  - name: LastName
+    generator:
+      length: 10
+  - name: ByteField
+    generator:
+      length: 10

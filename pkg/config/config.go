@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -52,8 +53,7 @@ type (
 		Operations       Operations    `mapstructure:"operations" yaml:"operations"`
 		Pool             Pool          `mapstructure:"pool" yaml:"pool"`
 		Tables           []Table       `mapstructure:"tables" yaml:"tables"`
-		Batch            bool          `mapstructure:"batch"`
-		BatchSize        int           `mapstructure:"batch_size"`
+		CommitDelay      time.Duration `mapstructure:"commit_delay" yaml:"commit_delay"`
 		clientOnce       sync.Once
 		client           *spanner.Client
 		contextOnce      sync.Once
@@ -78,6 +78,9 @@ func NewConfig(v *viper.Viper) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Log the commit delay value from configuration
+	log.Printf("Configuration commit delay: %v", c.CommitDelay)
 
 	return &c, nil
 }

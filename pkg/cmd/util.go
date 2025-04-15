@@ -24,9 +24,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudspannerecosystem/gcsb/pkg/config"
 	"github.com/olekukonko/tablewriter"
 	"github.com/rcrowley/go-metrics"
-	"github.com/cloudspannerecosystem/gcsb/pkg/config"
 )
 
 // graceful wraps a context cancel func with a listener for OS interrupt signals
@@ -44,7 +44,10 @@ func graceful(cancelFn context.CancelFunc) {
 func logTable(str *strings.Builder) {
 	scanner := bufio.NewScanner(strings.NewReader(str.String()))
 	for scanner.Scan() {
+		// Write to stderr for console output
 		log.Println(scanner.Text())
+		// Write to stdout for file capture
+		fmt.Println(scanner.Text())
 	}
 }
 
@@ -111,6 +114,7 @@ func summarizeTimings(registry metrics.Registry) {
 }
 
 func logConfig(cfg *config.Config) {
+	// Write to stderr for console output
 	log.Println("Configuration:")
 	log.Printf("\tProject: %s", cfg.Project)
 	log.Printf("\tInstance: %s", cfg.Instance)
@@ -121,4 +125,16 @@ func logConfig(cfg *config.Config) {
 	log.Printf("\t\tTotal: %d", cfg.Operations.Total)
 	log.Printf("\t\tRead: %d", cfg.Operations.Read)
 	log.Printf("\t\tWrite: %d", cfg.Operations.Write)
+
+	// Write to stdout for file capture
+	fmt.Println("Configuration:")
+	fmt.Printf("\tProject: %s\n", cfg.Project)
+	fmt.Printf("\tInstance: %s\n", cfg.Instance)
+	fmt.Printf("\tDatabase: %s\n", cfg.Database)
+	fmt.Printf("\tThreads: %d\n", cfg.Threads)
+	fmt.Printf("\tNumConns: %d\n", cfg.NumConns)
+	fmt.Printf("\tOperations:\n")
+	fmt.Printf("\t\tTotal: %d\n", cfg.Operations.Total)
+	fmt.Printf("\t\tRead: %d\n", cfg.Operations.Read)
+	fmt.Printf("\t\tWrite: %d\n", cfg.Operations.Write)
 }
