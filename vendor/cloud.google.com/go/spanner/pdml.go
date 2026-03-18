@@ -18,9 +18,12 @@ import (
 	"context"
 
 	"cloud.google.com/go/internal/trace"
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"github.com/googleapis/gax-go/v2"
-	sppb "google.golang.org/genproto/googleapis/spanner/v1"
+	"go.opencensus.io/tag"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 )
 
 // PartitionedUpdate executes a DML statement in parallel across the database,
@@ -48,14 +51,23 @@ func (c *Client) partitionedUpdate(ctx context.Context, statement Statement, opt
 	if err := checkNestedTxn(ctx); err != nil {
 		return 0, err
 	}
-
-	sh, err := c.idleSessions.take(ctx)
+	var sh *sessionHandle
+	if c.idleSessions.isMultiplexedSessionForPartitionedOpsEnabled() {
+		sh, err = c.idleSessions.takeMultiplexed(ctx)
+	} else {
+		sh, err = c.idleSessions.take(ctx)
+	}
 	if err != nil {
 		return 0, ToSpannerError(err)
 	}
-	if sh != nil {
-		defer sh.recycle()
+	if sh == nil {
+		return 0, spannerErrorf(codes.Internal, "no session available")
 	}
+	defer sh.recycle()
+	// Mark isLongRunningTransaction to true, as the session in case of partitioned dml can be long-running
+	sh.mu.Lock()
+	sh.eligibleForLongRunning = true
+	sh.mu.Unlock()
 
 	// Create the parameters and the SQL request, but without a transaction.
 	// The transaction reference will be added by the executePdml method.
@@ -77,9 +89,27 @@ func (c *Client) partitionedUpdate(ctx context.Context, statement Statement, opt
 	// Execute the PDML and retry if the transaction is aborted.
 	executePdmlWithRetry := func(ctx context.Context) (int64, error) {
 		for {
-			count, err := executePdml(ctx, sh, req)
+			count, err := executePdml(contextWithOutgoingMetadata(ctx, sh.getMetadata(), c.disableRouteToLeader), sh, req, options)
 			if err == nil {
 				return count, nil
+			}
+			if isUnimplementedErrorForMultiplexedPartitionedDML(err) && sh.session.pool.isMultiplexedSessionForPartitionedOpsEnabled() {
+				logf(c.logger, "Warning: Multiplexed sessions are not supported for partitioned operations in this environment. Falling back to regular sessions.")
+				sh.session.pool.disableMultiplexedSessionForPartitionedOps()
+				sh, err = c.idleSessions.take(ctx)
+				if err != nil {
+					return 0, ToSpannerError(err)
+				}
+				if sh == nil {
+					return 0, spannerErrorf(codes.Internal, "no session available")
+				}
+				defer sh.recycle()
+				// Mark isLongRunningTransaction to true, as the session in case of partitioned dml can be long-running
+				sh.mu.Lock()
+				sh.eligibleForLongRunning = true
+				sh.mu.Unlock()
+				req.Session = sh.getID()
+				continue
 			}
 			delay, shouldRetry := retryer.Retry(err)
 			if !shouldRetry {
@@ -99,12 +129,15 @@ func (c *Client) partitionedUpdate(ctx context.Context, statement Statement, opt
 // 3. Execute the update statement on the PDML transaction
 //
 // Note that PDML transactions cannot be committed or rolled back.
-func executePdml(ctx context.Context, sh *sessionHandle, req *sppb.ExecuteSqlRequest) (count int64, err error) {
+func executePdml(ctx context.Context, sh *sessionHandle, req *sppb.ExecuteSqlRequest, options QueryOptions) (count int64, err error) {
+	var md metadata.MD
+	sh.updateLastUseTime()
 	// Begin transaction.
-	res, err := sh.getClient().BeginTransaction(contextWithOutgoingMetadata(ctx, sh.getMetadata()), &sppb.BeginTransactionRequest{
+	res, err := sh.getClient().BeginTransaction(ctx, &sppb.BeginTransactionRequest{
 		Session: sh.getID(),
 		Options: &sppb.TransactionOptions{
-			Mode: &sppb.TransactionOptions_PartitionedDml_{PartitionedDml: &sppb.TransactionOptions_PartitionedDml{}},
+			Mode:                        &sppb.TransactionOptions_PartitionedDml_{PartitionedDml: &sppb.TransactionOptions_PartitionedDml{}},
+			ExcludeTxnFromChangeStreams: options.ExcludeTxnFromChangeStreams,
 		},
 	})
 	if err != nil {
@@ -114,10 +147,22 @@ func executePdml(ctx context.Context, sh *sessionHandle, req *sppb.ExecuteSqlReq
 	req.Transaction = &sppb.TransactionSelector{
 		Selector: &sppb.TransactionSelector_Id{Id: res.Id},
 	}
-	resultSet, err := sh.getClient().ExecuteSql(contextWithOutgoingMetadata(ctx, sh.getMetadata()), req)
+
+	sh.updateLastUseTime()
+	resultSet, err := sh.getClient().ExecuteSql(ctx, req, gax.WithGRPCOptions(grpc.Header(&md)))
+	if getGFELatencyMetricsFlag() && md != nil && sh.session.pool != nil {
+		err := captureGFELatencyStats(tag.NewContext(ctx, sh.session.pool.tagMap), md, "executePdml_ExecuteSql")
+		if err != nil {
+			trace.TracePrintf(ctx, nil, "Error in recording GFE Latency. Try disabling and rerunning. Error: %v", err)
+		}
+	}
+	if metricErr := recordGFELatencyMetricsOT(ctx, md, "executePdml_ExecuteSql", sh.session.pool.otConfig); metricErr != nil {
+		trace.TracePrintf(ctx, nil, "Error in recording GFE Latency through OpenTelemetry. Error: %v", metricErr)
+	}
 	if err != nil {
 		return 0, err
 	}
+
 	if resultSet.Stats == nil {
 		return 0, spannerErrorf(codes.InvalidArgument, "query passed to Update: %q", req.Sql)
 	}

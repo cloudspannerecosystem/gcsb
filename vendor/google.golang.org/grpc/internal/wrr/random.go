@@ -19,15 +19,15 @@ package wrr
 
 import (
 	"fmt"
-	"sync"
-
-	"google.golang.org/grpc/internal/grpcrand"
+	rand "math/rand/v2"
+	"sort"
 )
 
 // weightedItem is a wrapped weighted item that is used to implement weighted random algorithm.
 type weightedItem struct {
-	Item   interface{}
-	Weight int64
+	item              any
+	weight            int64
+	accumulatedWeight int64
 }
 
 func (w *weightedItem) String() string {
@@ -36,9 +36,9 @@ func (w *weightedItem) String() string {
 
 // randomWRR is a struct that contains weighted items implement weighted random algorithm.
 type randomWRR struct {
-	mu           sync.RWMutex
-	items        []*weightedItem
-	sumOfWeights int64
+	items []*weightedItem
+	// Are all item's weights equal
+	equalWeights bool
 }
 
 // NewRandom creates a new WRR with random.
@@ -46,32 +46,37 @@ func NewRandom() WRR {
 	return &randomWRR{}
 }
 
-var grpcrandInt63n = grpcrand.Int63n
+var randInt64n = rand.Int64N
 
-func (rw *randomWRR) Next() (item interface{}) {
-	rw.mu.RLock()
-	defer rw.mu.RUnlock()
-	if rw.sumOfWeights == 0 {
+func (rw *randomWRR) Next() (item any) {
+	if len(rw.items) == 0 {
 		return nil
 	}
-	// Random number in [0, sum).
-	randomWeight := grpcrandInt63n(rw.sumOfWeights)
-	for _, item := range rw.items {
-		randomWeight = randomWeight - item.Weight
-		if randomWeight < 0 {
-			return item.Item
-		}
+	if rw.equalWeights {
+		return rw.items[randInt64n(int64(len(rw.items)))].item
 	}
 
-	return rw.items[len(rw.items)-1].Item
+	sumOfWeights := rw.items[len(rw.items)-1].accumulatedWeight
+	// Random number in [0, sumOfWeights).
+	randomWeight := randInt64n(sumOfWeights)
+	// Item's accumulated weights are in ascending order, because item's weight >= 0.
+	// Binary search rw.items to find first item whose accumulatedWeight > randomWeight
+	// The return i is guaranteed to be in range [0, len(rw.items)) because randomWeight < last item's accumulatedWeight
+	i := sort.Search(len(rw.items), func(i int) bool { return rw.items[i].accumulatedWeight > randomWeight })
+	return rw.items[i].item
 }
 
-func (rw *randomWRR) Add(item interface{}, weight int64) {
-	rw.mu.Lock()
-	defer rw.mu.Unlock()
-	rItem := &weightedItem{Item: item, Weight: weight}
+func (rw *randomWRR) Add(item any, weight int64) {
+	accumulatedWeight := weight
+	equalWeights := true
+	if len(rw.items) > 0 {
+		lastItem := rw.items[len(rw.items)-1]
+		accumulatedWeight = lastItem.accumulatedWeight + weight
+		equalWeights = rw.equalWeights && weight == lastItem.weight
+	}
+	rw.equalWeights = equalWeights
+	rItem := &weightedItem{item: item, weight: weight, accumulatedWeight: accumulatedWeight}
 	rw.items = append(rw.items, rItem)
-	rw.sumOfWeights += weight
 }
 
 func (rw *randomWRR) String() string {

@@ -24,7 +24,8 @@ export GCLOUD_TESTS_GOLANG_PROJECT_ID=emulator-test-project
 echo "Running the Cloud Spanner emulator: $SPANNER_EMULATOR_HOST";
 
 # Download the emulator
-EMULATOR_VERSION=1.2.0
+# TODO: Find a way to use 'latest' here.
+EMULATOR_VERSION=1.4.0
 wget https://storage.googleapis.com/cloud-spanner-emulator/releases/${EMULATOR_VERSION}/cloud-spanner-emulator_linux_amd64-${EMULATOR_VERSION}.tar.gz
 tar zxvf cloud-spanner-emulator_linux_amd64-${EMULATOR_VERSION}.tar.gz
 chmod u+x emulator_main
@@ -36,11 +37,15 @@ EMULATOR_PID=$!
 
 # Stop the emulator & clean the environment variable
 function cleanup() {
-    kill -2 $EMULATOR_PID
+    kill -9 $EMULATOR_PID
     unset SPANNER_EMULATOR_HOST
     unset GCLOUD_TESTS_GOLANG_PROJECT_ID
     echo "Cleanup the emulator";
 }
 trap cleanup EXIT
 
-go test -v -timeout 10m ./... -run '^TestIntegration_' 2>&1 | tee -a sponge_log.log
+echo "Testing without GCPMultiEnpoint..." | tee -a sponge_log.log
+go test -count=1 -v -timeout 10m ./... -run '^TestIntegration_' 2>&1 | tee -a sponge_log.log
+
+echo "Testing with GCPMultiEnpoint..." | tee -a sponge_log.log
+GCLOUD_TESTS_GOLANG_USE_GRPC_GCP=true go test -count=1 -v -timeout 10m ./... -run '^TestIntegration_' 2>&1 | tee -a sponge_log.log
