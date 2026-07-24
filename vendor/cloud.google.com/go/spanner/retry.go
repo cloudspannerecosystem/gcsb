@@ -18,11 +18,11 @@ package spanner
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
 	"cloud.google.com/go/internal/trace"
-	"github.com/golang/protobuf/ptypes"
 	"github.com/googleapis/gax-go/v2"
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
@@ -79,14 +79,14 @@ func (r *spannerRetryer) Retry(err error) (time.Duration, bool) {
 	return delay, true
 }
 
-// runWithRetryOnAbortedOrSessionNotFound executes the given function and
-// retries it if it returns an Aborted or Session not found error. The retry
-// is delayed if the error was Aborted. The delay between retries is the delay
+// runWithRetryOnAbortedOrFailedInlineBeginOrSessionNotFound executes the given function and
+// retries it if it returns an Aborted, Session not found error or certain Internal errors. The retry
+// is delayed if the error was Aborted or Internal error. The delay between retries is the delay
 // returned by Cloud Spanner, or if none is returned, the calculated delay with
 // a minimum of 10ms and maximum of 32s. There is no delay before the retry if
-// the error was Session not found.
-func runWithRetryOnAbortedOrSessionNotFound(ctx context.Context, f func(context.Context) error) error {
-	retryer := onCodes(DefaultRetryBackoff, codes.Aborted)
+// the error was Session not found or failed inline begin transaction.
+func runWithRetryOnAbortedOrFailedInlineBeginOrSessionNotFound(ctx context.Context, f func(context.Context) error) error {
+	retryer := onCodes(DefaultRetryBackoff, codes.Aborted, codes.ResourceExhausted, codes.Internal)
 	funcWithRetry := func(ctx context.Context) error {
 		for {
 			err := f(ctx)
@@ -99,7 +99,7 @@ func runWithRetryOnAbortedOrSessionNotFound(ctx context.Context, f func(context.
 			// interface.
 			var retryErr error
 			var se *Error
-			if errorAs(err, &se) {
+			if errors.As(err, &se) {
 				// It is a (wrapped) Spanner error. Use that to check whether
 				// we should retry.
 				retryErr = se
@@ -113,6 +113,10 @@ func runWithRetryOnAbortedOrSessionNotFound(ctx context.Context, f func(context.
 			}
 			if isSessionNotFoundError(retryErr) {
 				trace.TracePrintf(ctx, nil, "Retrying after Session not found")
+				continue
+			}
+			if isFailedInlineBeginTransaction(retryErr) {
+				trace.TracePrintf(ctx, nil, "Retrying after failed inline begin transaction")
 				continue
 			}
 			delay, shouldRetry := retryer.Retry(retryErr)
@@ -133,7 +137,7 @@ func ExtractRetryDelay(err error) (time.Duration, bool) {
 	var se *Error
 	var s *status.Status
 	// Unwrap status error.
-	if errorAs(err, &se) {
+	if errors.As(err, &se) {
 		s = status.Convert(se.Unwrap())
 	} else {
 		s = status.Convert(err)
@@ -143,11 +147,10 @@ func ExtractRetryDelay(err error) (time.Duration, bool) {
 	}
 	for _, detail := range s.Details() {
 		if retryInfo, ok := detail.(*errdetails.RetryInfo); ok {
-			delay, err := ptypes.Duration(retryInfo.RetryDelay)
-			if err != nil {
+			if !retryInfo.GetRetryDelay().IsValid() {
 				return 0, false
 			}
-			return delay, true
+			return retryInfo.GetRetryDelay().AsDuration(), true
 		}
 	}
 	return 0, false
