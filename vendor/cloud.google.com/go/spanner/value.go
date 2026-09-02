@@ -22,20 +22,25 @@ import (
 	"database/sql/driver"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"cloud.google.com/go/civil"
 	"cloud.google.com/go/internal/fields"
-	"github.com/golang/protobuf/proto"
-	proto3 "github.com/golang/protobuf/ptypes/struct"
-	sppb "google.golang.org/genproto/googleapis/spanner/v1"
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/protoadapt"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	proto3 "google.golang.org/protobuf/types/known/structpb"
 )
 
 const (
@@ -112,25 +117,53 @@ var (
 	CommitTimestamp = commitTimestamp
 	commitTimestamp = time.Unix(0, 0).In(time.FixedZone("CommitTimestamp placeholder", 0xDB))
 
-	jsonNullBytes = []byte("null")
+	jsonUseNumber bool
+
+	protoMsgReflectType  = reflect.TypeOf((*proto.Message)(nil)).Elem()
+	protoEnumReflectType = reflect.TypeOf((*protoreflect.Enum)(nil)).Elem()
+
+	errPayloadNil = errors.New("payload should not be nil")
 )
+
+// UseNumberWithJSONDecoderEncoder specifies whether Cloud Spanner JSON numbers are decoded
+// as Number (preserving precision) or float64 (risking loss).
+// Defaults to the same behavior as the standard Go library, which means decoding to float64.
+// Call this method to enable lossless precision.
+// NOTE 1: Calling this method affects the behavior of all clients created by this library, both existing and future instances.
+// NOTE 2: This method sets a global variable that is used by the client to encode/decode JSON numbers. Access to the global variable is not synchronized. You should only call this method when there are no goroutines encoding/decoding Cloud Spanner JSON values. It is recommended to only call this method during the initialization of your application, and preferably before you create any Cloud Spanner clients, and/or in tests when there are no queries being executed.
+func UseNumberWithJSONDecoderEncoder(useNumber bool) {
+	jsonUseNumber = useNumber
+}
+
+func jsonUnmarshal(data []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if jsonUseNumber {
+		dec.UseNumber()
+	}
+	return dec.Decode(v)
+}
+
+// jsonIsNull returns whether v matches JSON null literal
+func jsonIsNull(v []byte) bool {
+	return string(v) == "null"
+}
 
 // Encoder is the interface implemented by a custom type that can be encoded to
 // a supported type by Spanner. A code example:
 //
-//   type customField struct {
-//       Prefix string
-//       Suffix string
-//   }
+//	type customField struct {
+//	    Prefix string
+//	    Suffix string
+//	}
 //
-//   // Convert a customField value to a string
-//   func (cf customField) EncodeSpanner() (interface{}, error) {
-//       var b bytes.Buffer
-//       b.WriteString(cf.Prefix)
-//       b.WriteString("-")
-//       b.WriteString(cf.Suffix)
-//       return b.String(), nil
-//   }
+//	// Convert a customField value to a string
+//	func (cf customField) EncodeSpanner() (interface{}, error) {
+//	    var b bytes.Buffer
+//	    b.WriteString(cf.Prefix)
+//	    b.WriteString("-")
+//	    b.WriteString(cf.Suffix)
+//	    return b.String(), nil
+//	}
 type Encoder interface {
 	EncodeSpanner() (interface{}, error)
 }
@@ -138,24 +171,24 @@ type Encoder interface {
 // Decoder is the interface implemented by a custom type that can be decoded
 // from a supported type by Spanner. A code example:
 //
-//   type customField struct {
-//       Prefix string
-//       Suffix string
-//   }
+//	type customField struct {
+//	    Prefix string
+//	    Suffix string
+//	}
 //
-//   // Convert a string to a customField value
-//   func (cf *customField) DecodeSpanner(val interface{}) (err error) {
-//       strVal, ok := val.(string)
-//       if !ok {
-//           return fmt.Errorf("failed to decode customField: %v", val)
-//       }
-//       s := strings.Split(strVal, "-")
-//       if len(s) > 1 {
-//           cf.Prefix = s[0]
-//           cf.Suffix = s[1]
-//       }
-//       return nil
-//   }
+//	// Convert a string to a customField value
+//	func (cf *customField) DecodeSpanner(val interface{}) (err error) {
+//	    strVal, ok := val.(string)
+//	    if !ok {
+//	        return fmt.Errorf("failed to decode customField: %v", val)
+//	    }
+//	    s := strings.Split(strVal, "-")
+//	    if len(s) > 1 {
+//	        cf.Prefix = s[0]
+//	        cf.Suffix = s[1]
+//	    }
+//	    return nil
+//	}
 type Decoder interface {
 	DecodeSpanner(input interface{}) error
 }
@@ -187,18 +220,15 @@ func (n NullInt64) String() string {
 
 // MarshalJSON implements json.Marshaler.MarshalJSON for NullInt64.
 func (n NullInt64) MarshalJSON() ([]byte, error) {
-	if n.Valid {
-		return []byte(fmt.Sprintf("%v", n.Int64)), nil
-	}
-	return jsonNullBytes, nil
+	return nulljson(n.Valid, n.Int64)
 }
 
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for NullInt64.
 func (n *NullInt64) UnmarshalJSON(payload []byte) error {
 	if payload == nil {
-		return fmt.Errorf("payload should not be nil")
+		return errPayloadNil
 	}
-	if bytes.Equal(payload, jsonNullBytes) {
+	if jsonIsNull(payload) {
 		n.Int64 = int64(0)
 		n.Valid = false
 		return nil
@@ -240,6 +270,20 @@ func (n *NullInt64) Scan(value interface{}) error {
 	case NullInt64:
 		n.Int64 = p.Int64
 		n.Valid = p.Valid
+	case string:
+		i64, err := strconv.ParseInt(p, 10, 64)
+		if err != nil {
+			return err
+		}
+		n.Int64 = i64
+		n.Valid = true
+	case *string:
+		i64, err := strconv.ParseInt(*p, 10, 64)
+		if err != nil {
+			return err
+		}
+		n.Int64 = i64
+		n.Valid = true
 	}
 	return nil
 }
@@ -270,28 +314,30 @@ func (n NullString) String() string {
 
 // MarshalJSON implements json.Marshaler.MarshalJSON for NullString.
 func (n NullString) MarshalJSON() ([]byte, error) {
-	if n.Valid {
-		return []byte(fmt.Sprintf("%q", n.StringVal)), nil
-	}
-	return jsonNullBytes, nil
+	return nulljson(n.Valid, n.StringVal)
 }
 
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for NullString.
 func (n *NullString) UnmarshalJSON(payload []byte) error {
 	if payload == nil {
-		return fmt.Errorf("payload should not be nil")
+		return errPayloadNil
 	}
-	if bytes.Equal(payload, jsonNullBytes) {
+	if jsonIsNull(payload) {
 		n.StringVal = ""
 		n.Valid = false
 		return nil
 	}
-	payload, err := trimDoubleQuotes(payload)
-	if err != nil {
+	var s *string
+	if err := jsonUnmarshal(payload, &s); err != nil {
 		return err
 	}
-	n.StringVal = string(payload)
-	n.Valid = true
+	if s != nil {
+		n.StringVal = *s
+		n.Valid = true
+	} else {
+		n.StringVal = ""
+		n.Valid = false
+	}
 	return nil
 }
 
@@ -353,18 +399,15 @@ func (n NullFloat64) String() string {
 
 // MarshalJSON implements json.Marshaler.MarshalJSON for NullFloat64.
 func (n NullFloat64) MarshalJSON() ([]byte, error) {
-	if n.Valid {
-		return []byte(fmt.Sprintf("%v", n.Float64)), nil
-	}
-	return jsonNullBytes, nil
+	return nulljson(n.Valid, n.Float64)
 }
 
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for NullFloat64.
 func (n *NullFloat64) UnmarshalJSON(payload []byte) error {
 	if payload == nil {
-		return fmt.Errorf("payload should not be nil")
+		return errPayloadNil
 	}
-	if bytes.Equal(payload, jsonNullBytes) {
+	if jsonIsNull(payload) {
 		n.Float64 = float64(0)
 		n.Valid = false
 		return nil
@@ -406,6 +449,20 @@ func (n *NullFloat64) Scan(value interface{}) error {
 	case NullFloat64:
 		n.Float64 = p.Float64
 		n.Valid = p.Valid
+	case string:
+		f, err := strconv.ParseFloat(p, 64)
+		if err != nil {
+			return err
+		}
+		n.Float64 = f
+		n.Valid = true
+	case *string:
+		f, err := strconv.ParseFloat(*p, 64)
+		if err != nil {
+			return err
+		}
+		n.Float64 = f
+		n.Valid = true
 	}
 	return nil
 }
@@ -413,6 +470,100 @@ func (n *NullFloat64) Scan(value interface{}) error {
 // GormDataType is used by gorm to determine the default data type for fields with this type.
 func (n NullFloat64) GormDataType() string {
 	return "FLOAT64"
+}
+
+// NullFloat32 represents a Cloud Spanner FLOAT32 that may be NULL.
+type NullFloat32 struct {
+	Float32 float32 // Float32 contains the value when it is non-NULL, and zero when NULL.
+	Valid   bool    // Valid is true if FLOAT32 is not NULL.
+}
+
+// IsNull implements NullableValue.IsNull for NullFloat32.
+func (n NullFloat32) IsNull() bool {
+	return !n.Valid
+}
+
+// String implements Stringer.String for NullFloat32
+func (n NullFloat32) String() string {
+	if !n.Valid {
+		return nullString
+	}
+	return fmt.Sprintf("%v", n.Float32)
+}
+
+// MarshalJSON implements json.Marshaler.MarshalJSON for NullFloat32.
+func (n NullFloat32) MarshalJSON() ([]byte, error) {
+	return nulljson(n.Valid, n.Float32)
+}
+
+// UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for NullFloat32.
+func (n *NullFloat32) UnmarshalJSON(payload []byte) error {
+	if payload == nil {
+		return errPayloadNil
+	}
+	if jsonIsNull(payload) {
+		n.Float32 = float32(0)
+		n.Valid = false
+		return nil
+	}
+	num, err := strconv.ParseFloat(string(payload), 32)
+	if err != nil {
+		return fmt.Errorf("payload cannot be converted to float32: got %v", string(payload))
+	}
+	n.Float32 = float32(num)
+	n.Valid = true
+	return nil
+}
+
+// Value implements the driver.Valuer interface.
+func (n NullFloat32) Value() (driver.Value, error) {
+	if n.IsNull() {
+		return nil, nil
+	}
+	return n.Float32, nil
+}
+
+// Scan implements the sql.Scanner interface.
+func (n *NullFloat32) Scan(value interface{}) error {
+	if value == nil {
+		n.Float32, n.Valid = 0, false
+		return nil
+	}
+	n.Valid = true
+	switch p := value.(type) {
+	default:
+		return spannerErrorf(codes.InvalidArgument, "invalid type for NullFloat32: %v", p)
+	case *float32:
+		n.Float32 = *p
+	case float32:
+		n.Float32 = p
+	case *NullFloat32:
+		n.Float32 = p.Float32
+		n.Valid = p.Valid
+	case NullFloat32:
+		n.Float32 = p.Float32
+		n.Valid = p.Valid
+	case string:
+		f, err := strconv.ParseFloat(p, 32)
+		if err != nil {
+			return err
+		}
+		n.Float32 = float32(f)
+		n.Valid = true
+	case *string:
+		f, err := strconv.ParseFloat(*p, 32)
+		if err != nil {
+			return err
+		}
+		n.Float32 = float32(f)
+		n.Valid = true
+	}
+	return nil
+}
+
+// GormDataType is used by gorm to determine the default data type for fields with this type.
+func (n NullFloat32) GormDataType() string {
+	return "FLOAT32"
 }
 
 // NullBool represents a Cloud Spanner BOOL that may be NULL.
@@ -436,18 +587,15 @@ func (n NullBool) String() string {
 
 // MarshalJSON implements json.Marshaler.MarshalJSON for NullBool.
 func (n NullBool) MarshalJSON() ([]byte, error) {
-	if n.Valid {
-		return []byte(fmt.Sprintf("%v", n.Bool)), nil
-	}
-	return jsonNullBytes, nil
+	return nulljson(n.Valid, n.Bool)
 }
 
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for NullBool.
 func (n *NullBool) UnmarshalJSON(payload []byte) error {
 	if payload == nil {
-		return fmt.Errorf("payload should not be nil")
+		return errPayloadNil
 	}
-	if bytes.Equal(payload, jsonNullBytes) {
+	if jsonIsNull(payload) {
 		n.Bool = false
 		n.Valid = false
 		return nil
@@ -489,6 +637,20 @@ func (n *NullBool) Scan(value interface{}) error {
 	case NullBool:
 		n.Bool = p.Bool
 		n.Valid = p.Valid
+	case string:
+		f, err := strconv.ParseBool(p)
+		if err != nil {
+			return err
+		}
+		n.Bool = f
+		n.Valid = true
+	case *string:
+		f, err := strconv.ParseBool(*p)
+		if err != nil {
+			return err
+		}
+		n.Bool = f
+		n.Valid = true
 	}
 	return nil
 }
@@ -519,18 +681,15 @@ func (n NullTime) String() string {
 
 // MarshalJSON implements json.Marshaler.MarshalJSON for NullTime.
 func (n NullTime) MarshalJSON() ([]byte, error) {
-	if n.Valid {
-		return []byte(fmt.Sprintf("%q", n.String())), nil
-	}
-	return jsonNullBytes, nil
+	return nulljson(n.Valid, n.Time)
 }
 
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for NullTime.
 func (n *NullTime) UnmarshalJSON(payload []byte) error {
 	if payload == nil {
-		return fmt.Errorf("payload should not be nil")
+		return errPayloadNil
 	}
-	if bytes.Equal(payload, jsonNullBytes) {
+	if jsonIsNull(payload) {
 		n.Time = time.Time{}
 		n.Valid = false
 		return nil
@@ -577,6 +736,20 @@ func (n *NullTime) Scan(value interface{}) error {
 	case NullTime:
 		n.Time = p.Time
 		n.Valid = p.Valid
+	case string:
+		f, err := time.Parse(time.RFC3339Nano, p)
+		if err != nil {
+			return err
+		}
+		n.Time = f
+		n.Valid = true
+	case *string:
+		f, err := time.Parse(time.RFC3339Nano, *p)
+		if err != nil {
+			return err
+		}
+		n.Time = f
+		n.Valid = true
 	}
 	return nil
 }
@@ -607,18 +780,15 @@ func (n NullDate) String() string {
 
 // MarshalJSON implements json.Marshaler.MarshalJSON for NullDate.
 func (n NullDate) MarshalJSON() ([]byte, error) {
-	if n.Valid {
-		return []byte(fmt.Sprintf("%q", n.String())), nil
-	}
-	return jsonNullBytes, nil
+	return nulljson(n.Valid, n.Date)
 }
 
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for NullDate.
 func (n *NullDate) UnmarshalJSON(payload []byte) error {
 	if payload == nil {
-		return fmt.Errorf("payload should not be nil")
+		return errPayloadNil
 	}
-	if bytes.Equal(payload, jsonNullBytes) {
+	if jsonIsNull(payload) {
 		n.Date = civil.Date{}
 		n.Valid = false
 		return nil
@@ -654,7 +824,12 @@ func (n *NullDate) Scan(value interface{}) error {
 	n.Valid = true
 	switch p := value.(type) {
 	default:
-		return spannerErrorf(codes.InvalidArgument, "invalid type for NullDate: %v", p)
+		d := civil.Date{}
+		if err := d.Scan(value); err != nil {
+			return err
+		}
+		n.Date = d
+		n.Valid = true
 	case *civil.Date:
 		n.Date = *p
 	case civil.Date:
@@ -695,18 +870,15 @@ func (n NullNumeric) String() string {
 
 // MarshalJSON implements json.Marshaler.MarshalJSON for NullNumeric.
 func (n NullNumeric) MarshalJSON() ([]byte, error) {
-	if n.Valid {
-		return []byte(fmt.Sprintf("%q", NumericString(&n.Numeric))), nil
-	}
-	return jsonNullBytes, nil
+	return nulljson(n.Valid, NumericString(&n.Numeric))
 }
 
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for NullNumeric.
 func (n *NullNumeric) UnmarshalJSON(payload []byte) error {
 	if payload == nil {
-		return fmt.Errorf("payload should not be nil")
+		return errPayloadNil
 	}
-	if bytes.Equal(payload, jsonNullBytes) {
+	if jsonIsNull(payload) {
 		n.Numeric = big.Rat{}
 		n.Valid = false
 		return nil
@@ -753,6 +925,20 @@ func (n *NullNumeric) Scan(value interface{}) error {
 	case NullNumeric:
 		n.Numeric = p.Numeric
 		n.Valid = p.Valid
+	case string:
+		y, ok := (&big.Rat{}).SetString(p)
+		if !ok {
+			return errUnexpectedNumericStr(p)
+		}
+		n.Numeric = *y
+		n.Valid = true
+	case *string:
+		y, ok := (&big.Rat{}).SetString(*p)
+		if !ok {
+			return errUnexpectedNumericStr(*p)
+		}
+		n.Numeric = *y
+		n.Valid = true
 	}
 	return nil
 }
@@ -795,25 +981,22 @@ func (n NullJSON) String() string {
 
 // MarshalJSON implements json.Marshaler.MarshalJSON for NullJSON.
 func (n NullJSON) MarshalJSON() ([]byte, error) {
-	if n.Valid {
-		return json.Marshal(n.Value)
-	}
-	return jsonNullBytes, nil
+	return nulljson(n.Valid, n.Value)
 }
 
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for NullJSON.
 func (n *NullJSON) UnmarshalJSON(payload []byte) error {
 	if payload == nil {
-		return fmt.Errorf("payload should not be nil")
+		return errPayloadNil
 	}
-	if bytes.Equal(payload, jsonNullBytes) {
+	if jsonIsNull(payload) {
 		n.Valid = false
 		return nil
 	}
 	var v interface{}
-	err := json.Unmarshal(payload, &v)
+	err := jsonUnmarshal(payload, &v)
 	if err != nil {
-		return fmt.Errorf("payload cannot be converted to a struct: got %v, err: %s", string(payload), err)
+		return fmt.Errorf("payload cannot be converted to a struct: got %v, err: %w", string(payload), err)
 	}
 	n.Value = v
 	n.Valid = true
@@ -825,12 +1008,288 @@ func (n NullJSON) GormDataType() string {
 	return "JSON"
 }
 
+// PGNumeric represents a Cloud Spanner PG Numeric that may be NULL.
+type PGNumeric struct {
+	Numeric string // Numeric contains the value when it is non-NULL, and an empty string when NULL.
+	Valid   bool   // Valid is true if Numeric is not NULL.
+}
+
+// IsNull implements NullableValue.IsNull for PGNumeric.
+func (n PGNumeric) IsNull() bool {
+	return !n.Valid
+}
+
+// String implements Stringer.String for PGNumeric
+func (n PGNumeric) String() string {
+	if !n.Valid {
+		return nullString
+	}
+	return n.Numeric
+}
+
+// MarshalJSON implements json.Marshaler.MarshalJSON for PGNumeric.
+func (n PGNumeric) MarshalJSON() ([]byte, error) {
+	return nulljson(n.Valid, n.Numeric)
+}
+
+// UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for PGNumeric.
+func (n *PGNumeric) UnmarshalJSON(payload []byte) error {
+	if payload == nil {
+		return errPayloadNil
+	}
+	if jsonIsNull(payload) {
+		n.Numeric = ""
+		n.Valid = false
+		return nil
+	}
+	payload, err := trimDoubleQuotes(payload)
+	if err != nil {
+		return err
+	}
+	n.Numeric = string(payload)
+	n.Valid = true
+	return nil
+}
+
+// NullProtoMessage represents a Cloud Spanner PROTO that may be NULL.
+// To write a NULL value using NullProtoMessage set ProtoMessageVal to typed nil and set Valid to true.
+type NullProtoMessage struct {
+	ProtoMessageVal proto.Message // ProtoMessageVal contains the value when Valid is true, and nil when NULL.
+	Valid           bool          // Valid is true if ProtoMessageVal is not NULL.
+}
+
+// IsNull implements NullableValue.IsNull for NullProtoMessage.
+func (n NullProtoMessage) IsNull() bool {
+	return !n.Valid
+}
+
+// String implements Stringer.String for NullProtoMessage.
+func (n NullProtoMessage) String() string {
+	if !n.Valid {
+		return nullString
+	}
+	return protoadapt.MessageV1Of(n.ProtoMessageVal).String()
+}
+
+// MarshalJSON implements json.Marshaler.MarshalJSON for NullProtoMessage.
+func (n NullProtoMessage) MarshalJSON() ([]byte, error) {
+	if n.Valid {
+		return json.Marshal(n.ProtoMessageVal)
+	}
+	return []byte("null"), nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for NullProtoMessage.
+func (n *NullProtoMessage) UnmarshalJSON(payload []byte) error {
+	if payload == nil {
+		return errPayloadNil
+	}
+	if jsonIsNull(payload) {
+		n.ProtoMessageVal = nil
+		n.Valid = false
+		return nil
+	}
+	err := jsonUnmarshal(payload, n.ProtoMessageVal)
+	if err != nil {
+		return fmt.Errorf("payload cannot be converted to a proto message: err: %s", err)
+	}
+	n.Valid = true
+	return nil
+}
+
+// NullProtoEnum represents a Cloud Spanner ENUM that may be NULL.
+// To write a NULL value using NullProtoEnum set ProtoEnumVal to typed nil and set Valid to true.
+type NullProtoEnum struct {
+	ProtoEnumVal protoreflect.Enum // ProtoEnumVal contains the value when Valid is true, and nil when NULL.
+	Valid        bool              // Valid is true if ProtoEnumVal is not NULL.
+}
+
+// IsNull implements NullableValue.IsNull for NullProtoEnum.
+func (n NullProtoEnum) IsNull() bool {
+	return !n.Valid
+}
+
+// String implements Stringer.String for NullProtoEnum.
+func (n NullProtoEnum) String() string {
+	if !n.Valid {
+		return nullString
+	}
+	return fmt.Sprintf("%v", n.ProtoEnumVal)
+}
+
+// MarshalJSON implements json.Marshaler.MarshalJSON for NullProtoEnum.
+func (n NullProtoEnum) MarshalJSON() ([]byte, error) {
+	if n.Valid && n.ProtoEnumVal != nil {
+		return []byte(fmt.Sprintf("%v", n.ProtoEnumVal.Number())), nil
+	}
+	return []byte("null"), nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for NullProtoEnum.
+func (n *NullProtoEnum) UnmarshalJSON(payload []byte) error {
+	if payload == nil {
+		return errPayloadNil
+	}
+	if jsonIsNull(payload) {
+		n.ProtoEnumVal = nil
+		n.Valid = false
+		return nil
+	}
+	if reflect.ValueOf(n.ProtoEnumVal).Kind() != reflect.Ptr {
+		return errNotAPointerField(n, n.ProtoEnumVal)
+	}
+	num, err := strconv.ParseInt(string(payload), 10, 64)
+	if err != nil {
+		return fmt.Errorf("payload cannot be converted to Enum: got %v", string(payload))
+	}
+	reflect.ValueOf(n.ProtoEnumVal).Elem().SetInt(num)
+	n.Valid = true
+	return nil
+}
+
+// NullUUID represents a Cloud Spanner UUID that may be NULL.
+type NullUUID struct {
+	UUID  uuid.UUID
+	Valid bool
+}
+
+// IsNull implements NullableValue.IsNull for NullUUID.
+func (n NullUUID) IsNull() bool {
+	return !n.Valid
+}
+
+// String implements Stringer.String for NullUUID
+func (n NullUUID) String() string {
+	if !n.Valid {
+		return nullString
+	}
+	return n.UUID.String()
+}
+
+// MarshalJSON NullUUID json.Marshaler.MarshalJSON for NullUUID.
+func (n NullUUID) MarshalJSON() ([]byte, error) {
+	return nulljson(n.Valid, n.UUID)
+}
+
+// UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for NullUUID.
+func (n *NullUUID) UnmarshalJSON(payload []byte) error {
+	if payload == nil {
+		return fmt.Errorf("payload should not be nil")
+	}
+	if jsonIsNull(payload) {
+		n.Valid = false
+		return nil
+	}
+	parsedUUID, err := uuid.ParseBytes(payload)
+	if err != nil {
+		return fmt.Errorf("payload cannot be converted to uuid: got %v", string(payload))
+	}
+	n.UUID = parsedUUID
+	n.Valid = true
+	return nil
+}
+
+// Value implements the driver.Valuer interface.
+func (n NullUUID) Value() (driver.Value, error) {
+	if n.IsNull() {
+		return nil, nil
+	}
+	return n.UUID, nil
+}
+
+// Scan implements the sql.Scanner interface.
+func (n *NullUUID) Scan(value interface{}) error {
+	if value == nil {
+		n.Valid = false
+		return nil
+	}
+	n.Valid = true
+	switch p := value.(type) {
+	default:
+		return spannerErrorf(codes.InvalidArgument, "invalid type for NullUUID: %v", p)
+	case *uuid.UUID:
+		n.UUID = *p
+	case uuid.UUID:
+		n.UUID = p
+	case *NullUUID:
+		n.UUID = p.UUID
+		n.Valid = p.Valid
+	case NullUUID:
+		n.UUID = p.UUID
+		n.Valid = p.Valid
+	}
+	return nil
+}
+
+// GormDataType is used by gorm to determine the default data type for fields with this type.
+func (n NullUUID) GormDataType() string {
+	return "UUID"
+}
+
 // NullRow represents a Cloud Spanner STRUCT that may be NULL.
 // See also the document for Row.
 // Note that NullRow is not a valid Cloud Spanner column Type.
 type NullRow struct {
 	Row   Row  // Row contains the value when it is non-NULL, and a zero Row when NULL.
 	Valid bool // Valid is true if Row is not NULL.
+}
+
+// PGJsonB represents a Cloud Spanner PGJsonB that may be NULL.
+type PGJsonB struct {
+	Value interface{} // Val contains the value when it is non-NULL, and nil when NULL.
+	Valid bool        // Valid is true if PGJsonB is not NULL.
+	// This is here to support customer wrappers around PGJsonB type, this will help during getDecodableSpannerType
+	// to differentiate between PGJsonB and NullJSON types.
+	_ bool
+}
+
+// IsNull implements NullableValue.IsNull for PGJsonB.
+func (n PGJsonB) IsNull() bool {
+	return !n.Valid
+}
+
+// String implements Stringer.String for PGJsonB.
+func (n PGJsonB) String() string {
+	if !n.Valid {
+		return nullString
+	}
+	b, err := json.Marshal(n.Value)
+	if err != nil {
+		return fmt.Sprintf("error: %v", err)
+	}
+	return fmt.Sprintf("%v", string(b))
+}
+
+// MarshalJSON implements json.Marshaler.MarshalJSON for PGJsonB.
+func (n PGJsonB) MarshalJSON() ([]byte, error) {
+	return nulljson(n.Valid, n.Value)
+}
+
+// UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for PGJsonB.
+func (n *PGJsonB) UnmarshalJSON(payload []byte) error {
+	if payload == nil {
+		return errPayloadNil
+	}
+	if jsonIsNull(payload) {
+		n.Valid = false
+		return nil
+	}
+
+	var v interface{}
+	err := jsonUnmarshal(payload, &v)
+	if err != nil {
+		return fmt.Errorf("payload cannot be converted to a struct: got %v, err: %w", string(payload), err)
+	}
+	n.Value = v
+	n.Valid = true
+	return nil
+}
+
+func nulljson(valid bool, v interface{}) ([]byte, error) {
+	if !valid {
+		return []byte("null"), nil
+	}
+	return json.Marshal(v)
 }
 
 // GenericColumnValue represents the generic encoded value and type of the
@@ -886,10 +1345,20 @@ func errNilDst(dst interface{}) error {
 	return spannerErrorf(codes.InvalidArgument, "cannot decode into nil type %T", dst)
 }
 
+// errNilDstField returns error for decoding into nil interface{} of Value field in NullProtoMessage or NullProtoEnum.
+func errNilDstField(dst interface{}, field string) error {
+	return spannerErrorf(codes.InvalidArgument, "field %s in %T cannot be nil", field, dst)
+}
+
 // errNilArrElemType returns error for input Cloud Spanner data type being a array but without a
 // non-nil array element type.
 func errNilArrElemType(t *sppb.Type) error {
 	return spannerErrorf(codes.FailedPrecondition, "array type %v is with nil array element type", t)
+}
+
+// errNotValidSrc returns error if Valid field is false for NullProtoMessage and NullProtoEnum
+func errNotValidSrc(dst interface{}) error {
+	return spannerErrorf(codes.InvalidArgument, "field \"Valid\" of %T cannot be set to false when writing data to Cloud Spanner. Use typed nil in %T to write null values to Cloud Spanner", dst, dst)
 }
 
 func errUnsupportedEmbeddedStructFields(fname string) error {
@@ -907,6 +1376,20 @@ func errDstNotForNull(dst interface{}) error {
 // errBadEncoding returns error for decoding wrongly encoded types.
 func errBadEncoding(v *proto3.Value, err error) error {
 	return spannerErrorf(codes.FailedPrecondition, "%v wasn't correctly encoded: <%v>", v, err)
+}
+
+// errNotAPointer returns error for decoding a non pointer type.
+func errNotAPointer(dst interface{}) error {
+	return spannerErrorf(codes.InvalidArgument, "destination %T must be a pointer", dst)
+}
+
+// errNotAPointerField returns error for decoding a non pointer type.
+func errNotAPointerField(dst interface{}, dstField interface{}) error {
+	return spannerErrorf(codes.InvalidArgument, "destination %T in %T must be a pointer", dstField, dst)
+}
+
+func errNilNotAllowed(dst interface{}, name string) error {
+	return spannerErrorf(codes.InvalidArgument, "destination %T does not support Null values. Use %s, an array with pointer type elements to read Null values", dst, name)
 }
 
 func parseNullTime(v *proto3.Value, p *NullTime, code sppb.TypeCode, isNull bool) error {
@@ -933,9 +1416,44 @@ func parseNullTime(v *proto3.Value, p *NullTime, code sppb.TypeCode, isNull bool
 	return nil
 }
 
+// tryDecodePointerToDecoder attempts to decode a **T where *T implements Decoder
+// Returns (handled, error) - handled=true if this case was processed
+func tryDecodePointerToDecoder(ptr interface{}, t *sppb.Type, v *proto3.Value, isNull bool) (bool, error) {
+	rv := reflect.ValueOf(ptr)
+	if rv.Kind() != reflect.Ptr || rv.Type().Elem().Kind() != reflect.Ptr {
+		return false, nil
+	}
+
+	elemType := rv.Type().Elem().Elem()
+	if !reflect.PointerTo(elemType).Implements(reflect.TypeOf((*Decoder)(nil)).Elem()) {
+		return false, nil
+	}
+
+	if isNull {
+		rv.Elem().Set(reflect.Zero(rv.Elem().Type()))
+		return true, nil
+	}
+
+	// Create a new instance of the underlying type
+	newInstance := reflect.New(elemType)
+	if decodedVal, ok := newInstance.Interface().(Decoder); ok {
+		x, err := getGenericValue(t, v)
+		if err != nil {
+			return true, err
+		}
+		if err := decodedVal.DecodeSpanner(x); err != nil {
+			return true, err
+		}
+		rv.Elem().Set(newInstance)
+		return true, nil
+	}
+
+	return false, nil
+}
+
 // decodeValue decodes a protobuf Value into a pointer to a Go value, as
 // specified by sppb.Type.
-func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
+func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}, opts ...DecodeOptions) error {
 	if v == nil {
 		return errNilSrc()
 	}
@@ -943,13 +1461,25 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 		return errNilSpannerType()
 	}
 	code := t.Code
+	typeAnnotation := t.TypeAnnotation
 	acode := sppb.TypeCode_TYPE_CODE_UNSPECIFIED
+	atypeAnnotation := sppb.TypeAnnotationCode_TYPE_ANNOTATION_CODE_UNSPECIFIED
 	if code == sppb.TypeCode_ARRAY {
 		if t.ArrayElementType == nil {
 			return errNilArrElemType(t)
 		}
 		acode = t.ArrayElementType.Code
+		atypeAnnotation = t.ArrayElementType.TypeAnnotation
 	}
+
+	if code == sppb.TypeCode_PROTO && reflect.TypeOf(ptr).Elem().Kind() == reflect.Ptr {
+		pve := reflect.ValueOf(ptr).Elem()
+		if pve.IsNil() {
+			pve.Set(reflect.New(pve.Type().Elem()))
+		}
+		ptr = pve.Interface()
+	}
+
 	_, isNull := v.Kind.(*proto3.Value_NullValue)
 
 	// Do the decoding based on the type of ptr.
@@ -1066,7 +1596,7 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 		if p == nil {
 			return errNilDst(p)
 		}
-		if code != sppb.TypeCode_BYTES {
+		if code != sppb.TypeCode_BYTES && code != sppb.TypeCode_PROTO {
 			return errTypeMismatch(code, acode, ptr)
 		}
 		if isNull {
@@ -1086,7 +1616,7 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 		if p == nil {
 			return errNilDst(p)
 		}
-		if acode != sppb.TypeCode_BYTES {
+		if acode != sppb.TypeCode_BYTES && acode != sppb.TypeCode_PROTO {
 			return errTypeMismatch(code, acode, ptr)
 		}
 		if isNull {
@@ -1106,7 +1636,7 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 		if p == nil {
 			return errNilDst(p)
 		}
-		if code != sppb.TypeCode_INT64 {
+		if code != sppb.TypeCode_INT64 && code != sppb.TypeCode_ENUM {
 			return errTypeMismatch(code, acode, ptr)
 		}
 		if isNull {
@@ -1125,7 +1655,7 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 		if p == nil {
 			return errNilDst(p)
 		}
-		if code != sppb.TypeCode_INT64 {
+		if code != sppb.TypeCode_INT64 && code != sppb.TypeCode_ENUM {
 			return errTypeMismatch(code, acode, ptr)
 		}
 		if isNull {
@@ -1156,7 +1686,7 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 		if p == nil {
 			return errNilDst(p)
 		}
-		if acode != sppb.TypeCode_INT64 {
+		if acode != sppb.TypeCode_INT64 && acode != sppb.TypeCode_ENUM {
 			return errTypeMismatch(code, acode, ptr)
 		}
 		if isNull {
@@ -1190,7 +1720,7 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 		if p == nil {
 			return errNilDst(p)
 		}
-		if acode != sppb.TypeCode_INT64 {
+		if acode != sppb.TypeCode_INT64 && acode != sppb.TypeCode_ENUM {
 			return errTypeMismatch(code, acode, ptr)
 		}
 		if isNull {
@@ -1398,6 +1928,102 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 			return err
 		}
 		*p = y
+	case *float32:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if code != sppb.TypeCode_FLOAT32 {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			return errDstNotForNull(ptr)
+		}
+		x, err := getFloat32Value(v)
+		if err != nil {
+			return err
+		}
+		*p = x
+	case *NullFloat32, **float32:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if code != sppb.TypeCode_FLOAT32 {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			switch sp := ptr.(type) {
+			case *NullFloat32:
+				*sp = NullFloat32{}
+			case **float32:
+				*sp = nil
+			}
+			break
+		}
+		x, err := getFloat32Value(v)
+		if err != nil {
+			return err
+		}
+		switch sp := ptr.(type) {
+		case *NullFloat32:
+			sp.Valid = true
+			sp.Float32 = x
+		case **float32:
+			*sp = &x
+		}
+	case *[]NullFloat32, *[]*float32:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if acode != sppb.TypeCode_FLOAT32 {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			switch sp := ptr.(type) {
+			case *[]NullFloat32:
+				*sp = nil
+			case *[]*float32:
+				*sp = nil
+			}
+			break
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		switch sp := ptr.(type) {
+		case *[]NullFloat32:
+			y, err := decodeNullFloat32Array(x)
+			if err != nil {
+				return err
+			}
+			*sp = y
+		case *[]*float32:
+			y, err := decodeFloat32PointerArray(x)
+			if err != nil {
+				return err
+			}
+			*sp = y
+		}
+	case *[]float32:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if acode != sppb.TypeCode_FLOAT32 {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			*p = nil
+			break
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := decodeFloat32Array(x)
+		if err != nil {
+			return err
+		}
+		*p = y
 	case *big.Rat:
 		if code != sppb.TypeCode_NUMERIC {
 			return errTypeMismatch(code, acode, ptr)
@@ -1438,7 +2064,7 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 			}
 			x := v.GetStringValue()
 			var y interface{}
-			err := json.Unmarshal([]byte(x), &y)
+			err := jsonUnmarshal([]byte(x), &y)
 			if err != nil {
 				return err
 			}
@@ -1548,6 +2174,76 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 			return err
 		}
 		y, err := decodeNumericArray(x)
+		if err != nil {
+			return err
+		}
+		*p = y
+	case *PGNumeric:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if code != sppb.TypeCode_NUMERIC || typeAnnotation != sppb.TypeAnnotationCode_PG_NUMERIC {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			*p = PGNumeric{}
+			break
+		}
+		*p = PGNumeric{v.GetStringValue(), true}
+	case *[]PGNumeric:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if acode != sppb.TypeCode_NUMERIC || atypeAnnotation != sppb.TypeAnnotationCode_PG_NUMERIC {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			*p = nil
+			break
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := decodePGNumericArray(x)
+		if err != nil {
+			return err
+		}
+		*p = y
+	case *PGJsonB:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if code != sppb.TypeCode_JSON || typeAnnotation != sppb.TypeAnnotationCode_PG_JSONB {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			*p = PGJsonB{}
+			break
+		}
+		x := v.GetStringValue()
+		var y interface{}
+		err := jsonUnmarshal([]byte(x), &y)
+		if err != nil {
+			return err
+		}
+		*p = PGJsonB{Value: y, Valid: true}
+	case *[]PGJsonB:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if acode != sppb.TypeCode_JSON || typeAnnotation != sppb.TypeAnnotationCode_PG_JSONB {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			*p = nil
+			break
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := decodePGJsonBArray(x)
 		if err != nil {
 			return err
 		}
@@ -1758,6 +2454,302 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 		*p = y
 	case *GenericColumnValue:
 		*p = GenericColumnValue{Type: t, Value: v}
+	case protoreflect.Enum:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if reflect.ValueOf(p).Kind() != reflect.Ptr {
+			return errNotAPointer(p)
+		}
+		if code != sppb.TypeCode_ENUM && code != sppb.TypeCode_INT64 {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			return errDstNotForNull(ptr)
+		}
+		y, err := getIntegerFromStringValue(v)
+		if err != nil {
+			return err
+		}
+		reflect.ValueOf(p).Elem().SetInt(y)
+	case *NullProtoEnum:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if p.ProtoEnumVal == nil {
+			return errNilDstField(p, "ProtoEnumVal")
+		}
+		if reflect.ValueOf(p.ProtoEnumVal).Kind() != reflect.Ptr {
+			return errNotAPointer(p)
+		}
+		if code != sppb.TypeCode_ENUM && code != sppb.TypeCode_INT64 {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			*p = NullProtoEnum{}
+			break
+		}
+		y, err := getIntegerFromStringValue(v)
+		if err != nil {
+			return err
+		}
+		reflect.ValueOf(p.ProtoEnumVal).Elem().SetInt(y)
+		p.Valid = true
+	case proto.Message:
+		// Check if the pointer is a custom type that implements spanner.Decoder
+		// interface.
+		if decodedVal, ok := ptr.(Decoder); ok {
+			x, err := getGenericValue(t, v)
+			if err != nil {
+				return err
+			}
+			return decodedVal.DecodeSpanner(x)
+		}
+		// Check if the pointer is a pointer to a pointer, and if the underlying type implements Decoder
+		if handled, err := tryDecodePointerToDecoder(ptr, t, v, isNull); handled {
+			return err
+		}
+		if p == nil {
+			return errNilDst(p)
+		}
+		if reflect.ValueOf(p).Kind() != reflect.Ptr {
+			return errNotAPointer(p)
+		}
+		if code != sppb.TypeCode_PROTO && code != sppb.TypeCode_BYTES {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			return errDstNotForNull(ptr)
+		}
+		y, err := getBytesFromStringValue(v)
+		if err != nil {
+			return err
+		}
+		err = proto.Unmarshal(y, p)
+		if err != nil {
+			return err
+		}
+	case *NullProtoMessage:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if p.ProtoMessageVal == nil {
+			return errNilDstField(p, "ProtoMessageVal")
+		}
+		if reflect.ValueOf(p.ProtoMessageVal).Kind() != reflect.Ptr {
+			return errNotAPointer(p.ProtoMessageVal)
+		}
+		if code != sppb.TypeCode_PROTO && code != sppb.TypeCode_BYTES {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			*p = NullProtoMessage{}
+			break
+		}
+		y, err := getBytesFromStringValue(v)
+		if err != nil {
+			return err
+		}
+		err = proto.Unmarshal(y, p.ProtoMessageVal)
+		if err != nil {
+			return err
+		}
+		p.Valid = true
+	case *Interval:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if code != sppb.TypeCode_INTERVAL {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			return errDstNotForNull(ptr)
+		}
+		x, err := getStringValue(v)
+		if err != nil {
+			return err
+		}
+		interval, err := ParseInterval(x)
+		if err != nil {
+			return errBadEncoding(v, err)
+		}
+		*p = interval
+	case *NullInterval:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if code != sppb.TypeCode_INTERVAL {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			*p = NullInterval{}
+			break
+		}
+		x, err := getStringValue(v)
+		if err != nil {
+			return err
+		}
+		interval, err := ParseInterval(x)
+		if err != nil {
+			return errBadEncoding(v, err)
+		}
+		*p = NullInterval{interval, true}
+	case *[]Interval:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if acode != sppb.TypeCode_INTERVAL {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			*p = nil
+			break
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := decodeIntervalArray(x)
+		if err != nil {
+			return err
+		}
+		*p = y
+	case *[]NullInterval:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if acode != sppb.TypeCode_INTERVAL {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			*p = nil
+			break
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := decodeNullIntervalArray(x)
+		if err != nil {
+			return err
+		}
+		*p = y
+	case *[]*Interval:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if acode != sppb.TypeCode_INTERVAL {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			*p = nil
+			break
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := decodeIntervalPointerArray(x)
+		if err != nil {
+			return err
+		}
+		*p = y
+	case *uuid.UUID:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if code != sppb.TypeCode_UUID {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			return errDstNotForNull(ptr)
+		}
+		x, err := getUUIDValue(v)
+		if err != nil {
+			return err
+		}
+		*p = x
+	case *NullUUID, **uuid.UUID:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if code != sppb.TypeCode_UUID {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			switch sp := ptr.(type) {
+			case *NullUUID:
+				*sp = NullUUID{}
+			case **uuid.UUID:
+				*sp = nil
+			}
+			break
+		}
+		x, err := getUUIDValue(v)
+		if err != nil {
+			return err
+		}
+		switch sp := ptr.(type) {
+		case *NullUUID:
+			sp.Valid = true
+			sp.UUID = x
+		case **uuid.UUID:
+			*sp = &x
+		}
+	case *[]uuid.UUID:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if acode != sppb.TypeCode_UUID {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			*p = nil
+			break
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := decodeUUIDArray(x)
+		if err != nil {
+			return err
+		}
+		*p = y
+	case *[]NullUUID, *[]*uuid.UUID:
+		if p == nil {
+			return errNilDst(p)
+		}
+		if acode != sppb.TypeCode_UUID {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			switch sp := ptr.(type) {
+			case *[]NullUUID:
+				*sp = nil
+			case *[]*NullUUID:
+				*sp = nil
+			}
+			break
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		switch sp := ptr.(type) {
+		case *[]NullUUID:
+			y, err := decodeNullUUIDArray(x)
+			if err != nil {
+				return err
+			}
+			*sp = y
+		case *[]*uuid.UUID:
+			y, err := decodeUUIDPointerArray(x)
+			if err != nil {
+				return err
+			}
+			*sp = y
+		}
 	default:
 		// Check if the pointer is a custom type that implements spanner.Decoder
 		// interface.
@@ -1768,6 +2760,10 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 			}
 			return decodedVal.DecodeSpanner(x)
 		}
+		// Check if the pointer is a pointer to a pointer, and if the underlying type implements Decoder
+		if handled, err := tryDecodePointerToDecoder(ptr, t, v, isNull); handled {
+			return err
+		}
 
 		// Check if the pointer is a variant of a base type.
 		decodableType := getDecodableSpannerType(ptr, true)
@@ -1775,7 +2771,43 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 			if isNull && !decodableType.supportsNull() {
 				return errDstNotForNull(ptr)
 			}
-			return decodableType.decodeValueToCustomType(v, t, acode, ptr)
+			return decodableType.decodeValueToCustomType(v, t, acode, atypeAnnotation, ptr)
+		}
+
+		rv := reflect.ValueOf(ptr)
+		typ := rv.Type()
+		// Check if the interface{} is a pointer and is of type array of proto columns
+		if typ.Kind() == reflect.Ptr && isAnArrayOfProtoColumn(ptr) && code == sppb.TypeCode_ARRAY {
+			if isNull {
+				rv.Elem().Set(reflect.Zero(rv.Elem().Type()))
+				break
+			}
+			// Get the user-defined type of the proto array
+			etyp := typ.Elem().Elem()
+			switch acode {
+			case sppb.TypeCode_PROTO, sppb.TypeCode_BYTES:
+				if etyp.Implements(protoMsgReflectType) {
+					if etyp.Kind() == reflect.Ptr {
+						x, err := getListValue(v)
+						if err != nil {
+							return err
+						}
+						return decodeProtoMessagePtrArray(x, t.ArrayElementType, rv)
+					}
+					return errTypeMismatch(code, acode, ptr)
+				}
+			case sppb.TypeCode_ENUM, sppb.TypeCode_INT64:
+				if etyp.Implements(protoEnumReflectType) {
+					x, err := getListValue(v)
+					if err != nil {
+						return err
+					}
+					if etyp.Kind() == reflect.Ptr {
+						return decodeProtoEnumPtrArray(x, t.ArrayElementType, rv)
+					}
+					return decodeProtoEnumArray(x, t.ArrayElementType, rv, ptr)
+				}
+			}
 		}
 
 		// Check if the proto encoding is for an array of structs.
@@ -1805,7 +2837,13 @@ func decodeValue(v *proto3.Value, t *sppb.Type, ptr interface{}) error {
 		if err != nil {
 			return err
 		}
-		if err = decodeStructArray(t.ArrayElementType.StructType, x, p); err != nil {
+		s := decodeSetting{
+			Lenient: false,
+		}
+		for _, opt := range opts {
+			opt.Apply(&s)
+		}
+		if err = decodeStructArray(t.ArrayElementType.StructType, x, p, s.Lenient); err != nil {
 			return err
 		}
 	}
@@ -1824,40 +2862,56 @@ const (
 	spannerTypeNonNullInt64
 	spannerTypeNonNullBool
 	spannerTypeNonNullFloat64
+	spannerTypeNonNullFloat32
 	spannerTypeNonNullNumeric
 	spannerTypeNonNullTime
 	spannerTypeNonNullDate
+	spannerTypeNonNullUUID
 	spannerTypeNullString
 	spannerTypeNullInt64
 	spannerTypeNullBool
 	spannerTypeNullFloat64
+	spannerTypeNullFloat32
 	spannerTypeNullTime
 	spannerTypeNullDate
 	spannerTypeNullNumeric
 	spannerTypeNullJSON
+	spannerTypeNullUUID
+	spannerTypePGNumeric
+	spannerTypePGJsonB
+	spannerTypeNonNullInterval
+	spannerTypeNullInterval
 	spannerTypeArrayOfNonNullString
 	spannerTypeArrayOfByteArray
 	spannerTypeArrayOfNonNullInt64
 	spannerTypeArrayOfNonNullBool
 	spannerTypeArrayOfNonNullFloat64
+	spannerTypeArrayOfNonNullFloat32
 	spannerTypeArrayOfNonNullNumeric
 	spannerTypeArrayOfNonNullTime
 	spannerTypeArrayOfNonNullDate
+	spannerTypeArrayOfNonNullUUID
 	spannerTypeArrayOfNullString
 	spannerTypeArrayOfNullInt64
 	spannerTypeArrayOfNullBool
 	spannerTypeArrayOfNullFloat64
+	spannerTypeArrayOfNullFloat32
 	spannerTypeArrayOfNullNumeric
 	spannerTypeArrayOfNullJSON
 	spannerTypeArrayOfNullTime
 	spannerTypeArrayOfNullDate
+	spannerTypeArrayOfNullUUID
+	spannerTypeArrayOfPGNumeric
+	spannerTypeArrayOfPGJsonB
+	spannerTypeArrayOfNonNullInterval
+	spannerTypeArrayOfNullInterval
 )
 
 // supportsNull returns true for the Go types that can hold a null value from
 // Spanner.
 func (d decodableSpannerType) supportsNull() bool {
 	switch d {
-	case spannerTypeNonNullString, spannerTypeNonNullInt64, spannerTypeNonNullBool, spannerTypeNonNullFloat64, spannerTypeNonNullTime, spannerTypeNonNullDate, spannerTypeNonNullNumeric:
+	case spannerTypeNonNullString, spannerTypeNonNullInt64, spannerTypeNonNullBool, spannerTypeNonNullFloat64, spannerTypeNonNullFloat32, spannerTypeNonNullTime, spannerTypeNonNullDate, spannerTypeNonNullNumeric, spannerTypeNonNullUUID:
 		return false
 	default:
 		return true
@@ -1874,14 +2928,21 @@ func (d decodableSpannerType) supportsNull() bool {
 var typeOfNonNullTime = reflect.TypeOf(time.Time{})
 var typeOfNonNullDate = reflect.TypeOf(civil.Date{})
 var typeOfNonNullNumeric = reflect.TypeOf(big.Rat{})
+var typeOfNonNullUUID = reflect.TypeOf(uuid.UUID{})
 var typeOfNullString = reflect.TypeOf(NullString{})
 var typeOfNullInt64 = reflect.TypeOf(NullInt64{})
 var typeOfNullBool = reflect.TypeOf(NullBool{})
 var typeOfNullFloat64 = reflect.TypeOf(NullFloat64{})
+var typeOfNullFloat32 = reflect.TypeOf(NullFloat32{})
 var typeOfNullTime = reflect.TypeOf(NullTime{})
 var typeOfNullDate = reflect.TypeOf(NullDate{})
 var typeOfNullNumeric = reflect.TypeOf(NullNumeric{})
 var typeOfNullJSON = reflect.TypeOf(NullJSON{})
+var typeOfNullUUID = reflect.TypeOf(NullUUID{})
+var typeOfPGNumeric = reflect.TypeOf(PGNumeric{})
+var typeOfPGJsonB = reflect.TypeOf(PGJsonB{})
+var typeOfNonNullInterval = reflect.TypeOf(Interval{})
+var typeOfNullInterval = reflect.TypeOf(NullInterval{})
 
 // getDecodableSpannerType returns the corresponding decodableSpannerType of
 // the given pointer.
@@ -1900,12 +2961,19 @@ func getDecodableSpannerType(ptr interface{}, isPtr bool) decodableSpannerType {
 	switch kind {
 	case reflect.Invalid:
 		return spannerTypeInvalid
+	case reflect.Array:
+		t := val.Type()
+		if t.ConvertibleTo(typeOfNonNullUUID) {
+			return spannerTypeNonNullUUID
+		}
 	case reflect.String:
 		return spannerTypeNonNullString
 	case reflect.Int64:
 		return spannerTypeNonNullInt64
 	case reflect.Bool:
 		return spannerTypeNonNullBool
+	case reflect.Float32:
+		return spannerTypeNonNullFloat32
 	case reflect.Float64:
 		return spannerTypeNonNullFloat64
 	case reflect.Ptr:
@@ -1915,6 +2983,9 @@ func getDecodableSpannerType(ptr interface{}, isPtr bool) decodableSpannerType {
 		}
 		if t.ConvertibleTo(typeOfNullJSON) {
 			return spannerTypeNullJSON
+		}
+		if t.ConvertibleTo(typeOfPGJsonB) {
+			return spannerTypePGJsonB
 		}
 	case reflect.Struct:
 		t := val.Type()
@@ -1926,6 +2997,9 @@ func getDecodableSpannerType(ptr interface{}, isPtr bool) decodableSpannerType {
 		}
 		if t.ConvertibleTo(typeOfNonNullDate) {
 			return spannerTypeNonNullDate
+		}
+		if t.ConvertibleTo(typeOfNonNullInterval) {
+			return spannerTypeNonNullInterval
 		}
 		if t.ConvertibleTo(typeOfNullString) {
 			return spannerTypeNullString
@@ -1939,6 +3013,9 @@ func getDecodableSpannerType(ptr interface{}, isPtr bool) decodableSpannerType {
 		if t.ConvertibleTo(typeOfNullFloat64) {
 			return spannerTypeNullFloat64
 		}
+		if t.ConvertibleTo(typeOfNullFloat32) {
+			return spannerTypeNullFloat32
+		}
 		if t.ConvertibleTo(typeOfNullTime) {
 			return spannerTypeNullTime
 		}
@@ -1950,6 +3027,18 @@ func getDecodableSpannerType(ptr interface{}, isPtr bool) decodableSpannerType {
 		}
 		if t.ConvertibleTo(typeOfNullJSON) {
 			return spannerTypeNullJSON
+		}
+		if t.ConvertibleTo(typeOfNullUUID) {
+			return spannerTypeNullUUID
+		}
+		if t.ConvertibleTo(typeOfPGNumeric) {
+			return spannerTypePGNumeric
+		}
+		if t.ConvertibleTo(typeOfPGJsonB) {
+			return spannerTypePGJsonB
+		}
+		if t.ConvertibleTo(typeOfNullInterval) {
+			return spannerTypeNullInterval
 		}
 	case reflect.Slice:
 		kind := val.Type().Elem().Kind()
@@ -1966,6 +3055,13 @@ func getDecodableSpannerType(ptr interface{}, isPtr bool) decodableSpannerType {
 			return spannerTypeArrayOfNonNullBool
 		case reflect.Float64:
 			return spannerTypeArrayOfNonNullFloat64
+		case reflect.Float32:
+			return spannerTypeArrayOfNonNullFloat32
+		case reflect.Array:
+			elemType := val.Type().Elem()
+			if elemType.ConvertibleTo(typeOfNonNullUUID) {
+				return spannerTypeArrayOfNonNullUUID
+			}
 		case reflect.Ptr:
 			t := val.Type().Elem()
 			if t.ConvertibleTo(typeOfNullNumeric) {
@@ -1994,6 +3090,9 @@ func getDecodableSpannerType(ptr interface{}, isPtr bool) decodableSpannerType {
 			if t.ConvertibleTo(typeOfNullFloat64) {
 				return spannerTypeArrayOfNullFloat64
 			}
+			if t.ConvertibleTo(typeOfNullFloat32) {
+				return spannerTypeArrayOfNullFloat32
+			}
 			if t.ConvertibleTo(typeOfNullTime) {
 				return spannerTypeArrayOfNullTime
 			}
@@ -2006,6 +3105,15 @@ func getDecodableSpannerType(ptr interface{}, isPtr bool) decodableSpannerType {
 			if t.ConvertibleTo(typeOfNullJSON) {
 				return spannerTypeArrayOfNullJSON
 			}
+			if t.ConvertibleTo(typeOfPGNumeric) {
+				return spannerTypeArrayOfPGNumeric
+			}
+			if t.ConvertibleTo(typeOfPGJsonB) {
+				return spannerTypeArrayOfPGJsonB
+			}
+			if t.ConvertibleTo(typeOfNullUUID) {
+				return spannerTypeArrayOfNullUUID
+			}
 		case reflect.Slice:
 			// The only array-of-array type that is supported is [][]byte.
 			kind := val.Type().Elem().Elem().Kind()
@@ -2015,6 +3123,8 @@ func getDecodableSpannerType(ptr interface{}, isPtr bool) decodableSpannerType {
 			}
 		}
 	}
+
+	// reflect.TypeOf(v)
 	// Not convertible to a known base type.
 	return spannerTypeUnknown
 }
@@ -2022,8 +3132,9 @@ func getDecodableSpannerType(ptr interface{}, isPtr bool) decodableSpannerType {
 // decodeValueToCustomType decodes a protobuf Value into a pointer to a Go
 // value. It must be possible to convert the value to the type pointed to by
 // the pointer.
-func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb.Type, acode sppb.TypeCode, ptr interface{}) error {
+func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb.Type, acode sppb.TypeCode, atypeAnnotation sppb.TypeAnnotationCode, ptr interface{}) error {
 	code := t.Code
+	typeAnnotation := t.TypeAnnotation
 	_, isNull := v.Kind.(*proto3.Value_NullValue)
 	if dsc == spannerTypeInvalid {
 		return errNilDst(ptr)
@@ -2052,7 +3163,7 @@ func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb
 			result = &NullString{x, !isNull}
 		}
 	case spannerTypeByteArray:
-		if code != sppb.TypeCode_BYTES {
+		if code != sppb.TypeCode_BYTES && code != sppb.TypeCode_PROTO {
 			return errTypeMismatch(code, acode, ptr)
 		}
 		if isNull {
@@ -2069,7 +3180,7 @@ func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb
 		}
 		result = y
 	case spannerTypeNonNullInt64, spannerTypeNullInt64:
-		if code != sppb.TypeCode_INT64 {
+		if code != sppb.TypeCode_INT64 && code != sppb.TypeCode_ENUM {
 			return errTypeMismatch(code, acode, ptr)
 		}
 		if isNull {
@@ -2123,6 +3234,23 @@ func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb
 		} else {
 			result = &NullFloat64{x, !isNull}
 		}
+	case spannerTypeNonNullFloat32, spannerTypeNullFloat32:
+		if code != sppb.TypeCode_FLOAT32 {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			result = &NullFloat32{}
+			break
+		}
+		x, err := getFloat32Value(v)
+		if err != nil {
+			return err
+		}
+		if dsc == spannerTypeNonNullFloat32 {
+			result = &x
+		} else {
+			result = &NullFloat32{x, !isNull}
+		}
 	case spannerTypeNonNullNumeric, spannerTypeNullNumeric:
 		if code != sppb.TypeCode_NUMERIC {
 			return errTypeMismatch(code, acode, ptr)
@@ -2141,6 +3269,15 @@ func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb
 		} else {
 			result = &NullNumeric{*y, true}
 		}
+	case spannerTypePGNumeric:
+		if code != sppb.TypeCode_NUMERIC || typeAnnotation != sppb.TypeAnnotationCode_PG_NUMERIC {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			result = &PGNumeric{}
+			break
+		}
+		result = &PGNumeric{v.GetStringValue(), true}
 	case spannerTypeNullJSON:
 		if code != sppb.TypeCode_JSON {
 			return errTypeMismatch(code, acode, ptr)
@@ -2151,11 +3288,26 @@ func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb
 		}
 		x := v.GetStringValue()
 		var y interface{}
-		err := json.Unmarshal([]byte(x), &y)
+		err := jsonUnmarshal([]byte(x), &y)
 		if err != nil {
 			return err
 		}
 		result = &NullJSON{y, true}
+	case spannerTypePGJsonB:
+		if code != sppb.TypeCode_JSON || typeAnnotation != sppb.TypeAnnotationCode_PG_JSONB {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			result = &PGJsonB{}
+			break
+		}
+		x := v.GetStringValue()
+		var y interface{}
+		err := jsonUnmarshal([]byte(x), &y)
+		if err != nil {
+			return err
+		}
+		result = &PGJsonB{Value: y, Valid: true}
 	case spannerTypeNonNullTime, spannerTypeNullTime:
 		var nt NullTime
 		err := parseNullTime(v, &nt, code, isNull)
@@ -2188,6 +3340,23 @@ func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb
 		} else {
 			result = &NullDate{y, !isNull}
 		}
+	case spannerTypeNonNullUUID, spannerTypeNullUUID:
+		if code != sppb.TypeCode_UUID {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			result = &NullUUID{}
+			break
+		}
+		x, err := getUUIDValue(v)
+		if err != nil {
+			return err
+		}
+		if dsc == spannerTypeNonNullUUID {
+			result = &x
+		} else {
+			result = &NullUUID{x, !isNull}
+		}
 	case spannerTypeArrayOfNonNullString, spannerTypeArrayOfNullString:
 		if acode != sppb.TypeCode_STRING {
 			return errTypeMismatch(code, acode, ptr)
@@ -2206,7 +3375,7 @@ func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb
 		}
 		result = y
 	case spannerTypeArrayOfByteArray:
-		if acode != sppb.TypeCode_BYTES {
+		if acode != sppb.TypeCode_BYTES && acode != sppb.TypeCode_PROTO {
 			return errTypeMismatch(code, acode, ptr)
 		}
 		if isNull {
@@ -2223,7 +3392,7 @@ func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb
 		}
 		result = y
 	case spannerTypeArrayOfNonNullInt64, spannerTypeArrayOfNullInt64:
-		if acode != sppb.TypeCode_INT64 {
+		if acode != sppb.TypeCode_INT64 && acode != sppb.TypeCode_ENUM {
 			return errTypeMismatch(code, acode, ptr)
 		}
 		if isNull {
@@ -2252,6 +3421,23 @@ func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb
 			return err
 		}
 		y, err := decodeGenericArray(reflect.TypeOf(ptr).Elem(), x, boolType(), "BOOL")
+		if err != nil {
+			return err
+		}
+		result = y
+	case spannerTypeArrayOfNonNullFloat32, spannerTypeArrayOfNullFloat32:
+		if acode != sppb.TypeCode_FLOAT32 {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			ptr = nil
+			return nil
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := decodeGenericArray(reflect.TypeOf(ptr).Elem(), x, float32Type(), "FLOAT32")
 		if err != nil {
 			return err
 		}
@@ -2290,6 +3476,23 @@ func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb
 			return err
 		}
 		result = y
+	case spannerTypeArrayOfPGNumeric:
+		if acode != sppb.TypeCode_NUMERIC || atypeAnnotation != sppb.TypeAnnotationCode_PG_NUMERIC {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			ptr = nil
+			return nil
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := decodeGenericArray(reflect.TypeOf(ptr).Elem(), x, pgNumericType(), "PGNUMERIC")
+		if err != nil {
+			return err
+		}
+		result = y
 	case spannerTypeArrayOfNullJSON:
 		if acode != sppb.TypeCode_JSON {
 			return errTypeMismatch(code, acode, ptr)
@@ -2303,6 +3506,23 @@ func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb
 			return err
 		}
 		y, err := decodeGenericArray(reflect.TypeOf(ptr).Elem(), x, jsonType(), "JSON")
+		if err != nil {
+			return err
+		}
+		result = y
+	case spannerTypeArrayOfPGJsonB:
+		if acode != sppb.TypeCode_JSON || atypeAnnotation != sppb.TypeAnnotationCode_PG_JSONB {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			ptr = nil
+			return nil
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := decodeGenericArray(reflect.TypeOf(ptr).Elem(), x, pgJsonbType(), "PGJSONB")
 		if err != nil {
 			return err
 		}
@@ -2341,6 +3561,23 @@ func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb
 			return err
 		}
 		result = y
+	case spannerTypeArrayOfNonNullUUID, spannerTypeArrayOfNullUUID:
+		if acode != sppb.TypeCode_UUID {
+			return errTypeMismatch(code, acode, ptr)
+		}
+		if isNull {
+			ptr = nil
+			return nil
+		}
+		x, err := getListValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := decodeGenericArray(reflect.TypeOf(ptr).Elem(), x, uuidType(), "UUID")
+		if err != nil {
+			return err
+		}
+		result = y
 	default:
 		// This should not be possible.
 		return fmt.Errorf("unknown decodable type found: %v", dsc)
@@ -2355,6 +3592,32 @@ func (dsc decodableSpannerType) decodeValueToCustomType(v *proto3.Value, t *sppb
 func errSrcVal(v *proto3.Value, want string) error {
 	return spannerErrorf(codes.FailedPrecondition, "cannot use %v(Kind: %T) as %s Value",
 		v, v.GetKind(), want)
+}
+
+// getIntegerFromStringValue returns the integer value of the string value encoded in proto3.Value v
+func getIntegerFromStringValue(v *proto3.Value) (int64, error) {
+	x, err := getStringValue(v)
+	if err != nil {
+		return 0, err
+	}
+	y, err := strconv.ParseInt(x, 10, 64)
+	if err != nil {
+		return 0, errBadEncoding(v, err)
+	}
+	return y, nil
+}
+
+// getBytesFromStringValue returns the bytes value of the string value encoded in proto3.Value v
+func getBytesFromStringValue(v *proto3.Value) ([]byte, error) {
+	x, err := getStringValue(v)
+	if err != nil {
+		return nil, err
+	}
+	y, err := base64.StdEncoding.DecodeString(x)
+	if err != nil {
+		return nil, errBadEncoding(v, err)
+	}
+	return y, nil
 }
 
 // getStringValue returns the string value encoded in proto3.Value v whose
@@ -2393,10 +3656,12 @@ func getGenericValue(t *sppb.Type, v *proto3.Value) (interface{}, error) {
 		return x.BoolValue, nil
 	case *proto3.Value_StringValue:
 		return x.StringValue, nil
+	case *proto3.Value_ListValue:
+		return x.ListValue, nil
 	case *proto3.Value_NullValue:
 		return getTypedNil(t)
 	default:
-		return 0, errSrcVal(v, "Number, Bool, String")
+		return 0, errSrcVal(v, "Number, Bool, String, List")
 	}
 }
 
@@ -2456,6 +3721,54 @@ func getFloat64Value(v *proto3.Value) (float64, error) {
 	return 0, errSrcVal(v, "Number")
 }
 
+// errUnexpectedFloat32Str returns error for decoder getting an unexpected
+// string for representing special float values.
+func errUnexpectedFloat32Str(s string) error {
+	return spannerErrorf(codes.FailedPrecondition, "unexpected string value %q for float32 number", s)
+}
+
+// getFloat32Value returns the float32 value encoded in proto3.Value v whose
+// kind is proto3.Value_NumberValue / proto3.Value_StringValue.
+// Cloud Spanner uses string to encode NaN, Infinity and -Infinity.
+func getFloat32Value(v *proto3.Value) (float32, error) {
+	switch x := v.GetKind().(type) {
+	case *proto3.Value_NumberValue:
+		if x == nil {
+			break
+		}
+		return float32(x.NumberValue), nil
+	case *proto3.Value_StringValue:
+		if x == nil {
+			break
+		}
+		switch x.StringValue {
+		case "NaN":
+			return float32(math.NaN()), nil
+		case "Infinity":
+			return float32(math.Inf(1)), nil
+		case "-Infinity":
+			return float32(math.Inf(-1)), nil
+		default:
+			return 0, errUnexpectedFloat32Str(x.StringValue)
+		}
+	}
+	return 0, errSrcVal(v, "Number")
+}
+
+// getUUIDValue returns the uuid value encoded in proto3.Value v whose
+// kind is proto3.Value_StringValue.
+func getUUIDValue(v *proto3.Value) (uuid.UUID, error) {
+	x, err := getStringValue(v)
+	if err != nil {
+		return uuid.UUID{}, err
+	}
+	u, err := uuid.Parse(x)
+	if err != nil {
+		return uuid.UUID{}, errBadEncoding(v, err)
+	}
+	return u, nil
+}
+
 // errNilListValue returns error for unexpected nil ListValue in decoding Cloud Spanner ARRAYs.
 func errNilListValue(sqlType string) error {
 	return spannerErrorf(codes.FailedPrecondition, "unexpected nil ListValue in decoding %v array", sqlType)
@@ -2464,7 +3777,7 @@ func errNilListValue(sqlType string) error {
 // errDecodeArrayElement returns error for failure in decoding single array element.
 func errDecodeArrayElement(i int, v proto.Message, sqlType string, err error) error {
 	var se *Error
-	if !errorAs(err, &se) {
+	if !errors.As(err, &se) {
 		return spannerErrorf(codes.Unknown,
 			"cannot decode %v(array element %v) as %v, error = <%v>", v, i, sqlType, err)
 	}
@@ -2656,6 +3969,48 @@ func decodeFloat64Array(pb *proto3.ListValue) ([]float64, error) {
 	return a, nil
 }
 
+// decodeNullFloat32Array decodes proto3.ListValue pb into a NullFloat32 slice.
+func decodeNullFloat32Array(pb *proto3.ListValue) ([]NullFloat32, error) {
+	if pb == nil {
+		return nil, errNilListValue("FLOAT32")
+	}
+	a := make([]NullFloat32, len(pb.Values))
+	for i, v := range pb.Values {
+		if err := decodeValue(v, float32Type(), &a[i]); err != nil {
+			return nil, errDecodeArrayElement(i, v, "FLOAT32", err)
+		}
+	}
+	return a, nil
+}
+
+// decodeFloat32PointerArray decodes proto3.ListValue pb into a *float32 slice.
+func decodeFloat32PointerArray(pb *proto3.ListValue) ([]*float32, error) {
+	if pb == nil {
+		return nil, errNilListValue("FLOAT32")
+	}
+	a := make([]*float32, len(pb.Values))
+	for i, v := range pb.Values {
+		if err := decodeValue(v, float32Type(), &a[i]); err != nil {
+			return nil, errDecodeArrayElement(i, v, "FLOAT32", err)
+		}
+	}
+	return a, nil
+}
+
+// decodeFloat32Array decodes proto3.ListValue pb into a float32 slice.
+func decodeFloat32Array(pb *proto3.ListValue) ([]float32, error) {
+	if pb == nil {
+		return nil, errNilListValue("FLOAT32")
+	}
+	a := make([]float32, len(pb.Values))
+	for i, v := range pb.Values {
+		if err := decodeValue(v, float32Type(), &a[i]); err != nil {
+			return nil, errDecodeArrayElement(i, v, "FLOAT32", err)
+		}
+	}
+	return a, nil
+}
+
 // decodeNullNumericArray decodes proto3.ListValue pb into a NullNumeric slice.
 func decodeNullNumericArray(pb *proto3.ListValue) ([]NullNumeric, error) {
 	if pb == nil {
@@ -2684,6 +4039,20 @@ func decodeNullJSONArray(pb *proto3.ListValue) ([]NullJSON, error) {
 	return a, nil
 }
 
+// decodeJsonBArray decodes proto3.ListValue pb into a JsonB slice.
+func decodePGJsonBArray(pb *proto3.ListValue) ([]PGJsonB, error) {
+	if pb == nil {
+		return nil, errNilListValue("PGJSONB")
+	}
+	a := make([]PGJsonB, len(pb.Values))
+	for i, v := range pb.Values {
+		if err := decodeValue(v, pgJsonbType(), &a[i]); err != nil {
+			return nil, errDecodeArrayElement(i, v, "PGJSONB", err)
+		}
+	}
+	return a, nil
+}
+
 // decodeNullJSONArray decodes proto3.ListValue pb into a NullJSON pointer.
 func decodeNullJSONArrayToNullJSON(pb *proto3.ListValue) (*NullJSON, error) {
 	if pb == nil {
@@ -2699,7 +4068,7 @@ func decodeNullJSONArrayToNullJSON(pb *proto3.ListValue) (*NullJSON, error) {
 	}
 	s := fmt.Sprintf("[%s]", strings.Join(strs, ","))
 	var y interface{}
-	err := json.Unmarshal([]byte(s), &y)
+	err := jsonUnmarshal([]byte(s), &y)
 	if err != nil {
 		return nil, err
 	}
@@ -2734,6 +4103,20 @@ func decodeNumericArray(pb *proto3.ListValue) ([]big.Rat, error) {
 	return a, nil
 }
 
+// decodePGNumericArray decodes proto3.ListValue pb into a PGNumeric slice.
+func decodePGNumericArray(pb *proto3.ListValue) ([]PGNumeric, error) {
+	if pb == nil {
+		return nil, errNilListValue("PGNUMERIC")
+	}
+	a := make([]PGNumeric, len(pb.Values))
+	for i, v := range pb.Values {
+		if err := decodeValue(v, pgNumericType(), &a[i]); err != nil {
+			return nil, errDecodeArrayElement(i, v, "PGNUMERIC", err)
+		}
+	}
+	return a, nil
+}
+
 // decodeByteArray decodes proto3.ListValue pb into a slice of byte slice.
 func decodeByteArray(pb *proto3.ListValue) ([][]byte, error) {
 	if pb == nil {
@@ -2746,6 +4129,83 @@ func decodeByteArray(pb *proto3.ListValue) ([][]byte, error) {
 		}
 	}
 	return a, nil
+}
+
+// decodeProtoMessagePtrArray decodes proto3.ListValue pb into a *proto.Message slice.
+// The elements in the array implements proto.Message interface only if the element is a pointer (e.g. *ProtoMessage).
+// However, if the element is a value (e.g. ProtoMessage), then it does not implement proto.Message.
+// Therefore, decodeProtoMessagePtrArray allows decoding of proto message array if the array element is a pointer only.
+func decodeProtoMessagePtrArray(pb *proto3.ListValue, t *sppb.Type, rv reflect.Value) error {
+	if pb == nil {
+		return errNilListValue("PROTO")
+	}
+	etyp := rv.Type().Elem().Elem().Elem()
+	a := reflect.MakeSlice(rv.Type().Elem(), len(pb.Values), len(pb.Values))
+	for i, v := range pb.Values {
+		_, isNull := v.Kind.(*proto3.Value_NullValue)
+		if isNull {
+			continue
+		}
+		msg := reflect.New(etyp).Interface().(proto.Message)
+		if err := decodeValue(v, t, msg); err != nil {
+			return errDecodeArrayElement(i, v, "PROTO", err)
+		}
+		a.Index(i).Set(reflect.ValueOf(msg))
+	}
+	rv.Elem().Set(a)
+	return nil
+}
+
+// decodeProtoEnumPtrArray decodes proto3.ListValue pb into a *protoreflect.Enum slice.
+func decodeProtoEnumPtrArray(pb *proto3.ListValue, t *sppb.Type, rv reflect.Value) error {
+	if pb == nil {
+		return errNilListValue("ENUM")
+	}
+	etyp := rv.Type().Elem().Elem().Elem()
+	a := reflect.MakeSlice(rv.Type().Elem(), len(pb.Values), len(pb.Values))
+	for i, v := range pb.Values {
+		_, isNull := v.Kind.(*proto3.Value_NullValue)
+		if isNull {
+			continue
+		}
+		enum := reflect.New(etyp).Interface().(protoreflect.Enum)
+		if err := decodeValue(v, t, enum); err != nil {
+			return errDecodeArrayElement(i, v, "ENUM", err)
+		}
+		a.Index(i).Set(reflect.ValueOf(enum))
+	}
+	rv.Elem().Set(a)
+	return nil
+}
+
+// decodeProtoEnumArray decodes proto3.ListValue pb into a protoreflect.Enum slice.
+func decodeProtoEnumArray(pb *proto3.ListValue, t *sppb.Type, rv reflect.Value, ptr interface{}) error {
+	if pb == nil {
+		return errNilListValue("ENUM")
+	}
+	a := reflect.MakeSlice(rv.Type().Elem(), len(pb.Values), len(pb.Values))
+	// decodeValue method can decode only if ENUM is a pointer type.
+	// As the ENUM element in the Array is not a pointer type we cannot use decodeValue method
+	// and hence handle it separately.
+	for i, v := range pb.Values {
+		_, isNull := v.Kind.(*proto3.Value_NullValue)
+		// As the ENUM elements in the array are value type and not pointer type,
+		// we cannot support NULL values in the array
+		if isNull {
+			return errNilNotAllowed(ptr, "*[]*protoreflect.Enum")
+		}
+		x, err := getStringValue(v)
+		if err != nil {
+			return err
+		}
+		y, err := strconv.ParseInt(x, 10, 64)
+		if err != nil {
+			return errBadEncoding(v, err)
+		}
+		a.Index(i).SetInt(y)
+	}
+	rv.Elem().Set(a)
+	return nil
 }
 
 // decodeNullTimeArray decodes proto3.ListValue pb into a NullTime slice.
@@ -2832,6 +4292,48 @@ func decodeDateArray(pb *proto3.ListValue) ([]civil.Date, error) {
 	return a, nil
 }
 
+// decodeNullUUIDArray decodes proto3.ListValue pb into a NullUUID slice.
+func decodeNullUUIDArray(pb *proto3.ListValue) ([]NullUUID, error) {
+	if pb == nil {
+		return nil, errNilListValue("UUID")
+	}
+	a := make([]NullUUID, len(pb.Values))
+	for i, v := range pb.Values {
+		if err := decodeValue(v, uuidType(), &a[i]); err != nil {
+			return nil, errDecodeArrayElement(i, v, "UUID", err)
+		}
+	}
+	return a, nil
+}
+
+// decodeUUIDPointerArray decodes proto3.ListValue pb into a *uuid.UUID slice.
+func decodeUUIDPointerArray(pb *proto3.ListValue) ([]*uuid.UUID, error) {
+	if pb == nil {
+		return nil, errNilListValue("UUID")
+	}
+	a := make([]*uuid.UUID, len(pb.Values))
+	for i, v := range pb.Values {
+		if err := decodeValue(v, uuidType(), &a[i]); err != nil {
+			return nil, errDecodeArrayElement(i, v, "UUID", err)
+		}
+	}
+	return a, nil
+}
+
+// decodeUUIDArray decodes proto3.ListValue pb into a uuid.UUID slice.
+func decodeUUIDArray(pb *proto3.ListValue) ([]uuid.UUID, error) {
+	if pb == nil {
+		return nil, errNilListValue("UUID")
+	}
+	a := make([]uuid.UUID, len(pb.Values))
+	for i, v := range pb.Values {
+		if err := decodeValue(v, uuidType(), &a[i]); err != nil {
+			return nil, errDecodeArrayElement(i, v, "UUID", err)
+		}
+	}
+	return a, nil
+}
+
 func errNotStructElement(i int, v *proto3.Value) error {
 	return errDecodeArrayElement(i, v, "STRUCT",
 		spannerErrorf(codes.FailedPrecondition, "%v(type: %T) doesn't encode Cloud Spanner STRUCT", v, v))
@@ -2899,12 +4401,33 @@ func errDupSpannerField(f string, ty *sppb.StructType) error {
 // a Cloud Spanner STRUCT.
 func errDecodeStructField(ty *sppb.StructType, f string, err error) error {
 	var se *Error
-	if !errorAs(err, &se) {
+	if !errors.As(err, &se) {
 		return spannerErrorf(codes.Unknown,
 			"cannot decode field %v of Cloud Spanner STRUCT %+v, error = <%v>", f, ty, err)
 	}
 	se.decorate(fmt.Sprintf("cannot decode field %v of Cloud Spanner STRUCT %+v", f, ty))
 	return se
+}
+
+// decodeSetting contains all the settings for decoding from spanner struct
+type decodeSetting struct {
+	Lenient bool
+}
+
+// DecodeOptions is the interface to change decode struct settings
+type DecodeOptions interface {
+	Apply(s *decodeSetting)
+}
+
+type withLenient struct{ lenient bool }
+
+func (w withLenient) Apply(s *decodeSetting) {
+	s.Lenient = w.lenient
+}
+
+// WithLenient returns a DecodeOptions that allows decoding into a struct with missing fields in database.
+func WithLenient() DecodeOptions {
+	return withLenient{lenient: true}
 }
 
 // decodeStruct decodes proto3.ListValue pb into struct referenced by pointer
@@ -2951,8 +4474,9 @@ func decodeStruct(ty *sppb.StructType, pb *proto3.ListValue, ptr interface{}, le
 			// We don't allow duplicated field name.
 			return errDupSpannerField(f.Name, ty)
 		}
+		opts := []DecodeOptions{withLenient{lenient: lenient}}
 		// Try to decode a single field.
-		if err := decodeValue(pb.Values[i], f.Type, v.FieldByIndex(sf.Index).Addr().Interface()); err != nil {
+		if err := decodeValue(pb.Values[i], f.Type, v.FieldByIndex(sf.Index).Addr().Interface(), opts...); err != nil {
 			return errDecodeStructField(ty, f.Name, err)
 		}
 		// Mark field f.Name as processed.
@@ -2977,7 +4501,7 @@ func isPtrStructPtrSlice(t reflect.Type) bool {
 // decodeStructArray decodes proto3.ListValue pb into struct slice referenced by
 // pointer ptr, according to the
 // structural information given in a sppb.StructType.
-func decodeStructArray(ty *sppb.StructType, pb *proto3.ListValue, ptr interface{}) error {
+func decodeStructArray(ty *sppb.StructType, pb *proto3.ListValue, ptr interface{}, lenient bool) error {
 	if pb == nil {
 		return errNilListValue("STRUCT")
 	}
@@ -3003,7 +4527,7 @@ func decodeStructArray(ty *sppb.StructType, pb *proto3.ListValue, ptr interface{
 			return errDecodeArrayElement(i, pv, "STRUCT", err)
 		}
 		// Decode proto3.ListValue l into struct referenced by s.Interface().
-		if err = decodeStruct(ty, l, s.Interface(), false); err != nil {
+		if err = decodeStruct(ty, l, s.Interface(), lenient); err != nil {
 			return errDecodeArrayElement(i, pv, "STRUCT", err)
 		}
 		// Append the decoded struct back into the slice.
@@ -3058,6 +4582,31 @@ func encodeValue(v interface{}) (*proto3.Value, *sppb.Type, error) {
 	var err error
 	switch v := v.(type) {
 	case nil:
+	case Interval:
+		pb.Kind = stringKind(v.String())
+		pt = &sppb.Type{Code: sppb.TypeCode_INTERVAL}
+	case []Interval:
+		if v != nil {
+			pb, err = encodeArray(len(v), func(i int) interface{} { return v[i] })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		pt = listType(&sppb.Type{Code: sppb.TypeCode_INTERVAL})
+	case NullInterval:
+		if !v.Valid {
+			pt = &sppb.Type{Code: sppb.TypeCode_INTERVAL}
+			break
+		}
+		return encodeValue(v.Interval)
+	case []NullInterval:
+		if v != nil {
+			pb, err = encodeArray(len(v), func(i int) interface{} { return v[i] })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		pt = listType(intervalType())
 	case string:
 		pb.Kind = stringKind(v)
 		pt = stringType()
@@ -3235,6 +4784,43 @@ func encodeValue(v interface{}) (*proto3.Value, *sppb.Type, error) {
 			}
 		}
 		pt = listType(floatType())
+	case float32:
+		pb.Kind = &proto3.Value_NumberValue{NumberValue: float64(v)}
+		pt = float32Type()
+	case []float32:
+		if v != nil {
+			pb, err = encodeArray(len(v), func(i int) interface{} { return v[i] })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		pt = listType(float32Type())
+	case NullFloat32:
+		if v.Valid {
+			return encodeValue(v.Float32)
+		}
+		pt = float32Type()
+	case []NullFloat32:
+		if v != nil {
+			pb, err = encodeArray(len(v), func(i int) interface{} { return v[i] })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		pt = listType(float32Type())
+	case *float32:
+		if v != nil {
+			return encodeValue(*v)
+		}
+		pt = float32Type()
+	case []*float32:
+		if v != nil {
+			pb, err = encodeArray(len(v), func(i int) interface{} { return v[i] })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		pt = listType(float32Type())
 	case big.Rat:
 		switch LossOfPrecisionHandling {
 		case NumericError:
@@ -3268,6 +4854,19 @@ func encodeValue(v interface{}) (*proto3.Value, *sppb.Type, error) {
 			}
 		}
 		pt = listType(numericType())
+	case PGNumeric:
+		if v.Valid {
+			pb.Kind = stringKind(v.Numeric)
+		}
+		return pb, pgNumericType(), nil
+	case []PGNumeric:
+		if v != nil {
+			pb, err = encodeArray(len(v), func(i int) interface{} { return v[i] })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		pt = listType(pgNumericType())
 	case NullJSON:
 		if v.Valid {
 			b, err := json.Marshal(v.Value)
@@ -3285,6 +4884,23 @@ func encodeValue(v interface{}) (*proto3.Value, *sppb.Type, error) {
 			}
 		}
 		pt = listType(jsonType())
+	case PGJsonB:
+		if v.Valid {
+			b, err := json.Marshal(v.Value)
+			if err != nil {
+				return nil, nil, err
+			}
+			pb.Kind = stringKind(string(b))
+		}
+		return pb, pgJsonbType(), nil
+	case []PGJsonB:
+		if v != nil {
+			pb, err = encodeArray(len(v), func(i int) interface{} { return v[i] })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		pt = listType(pgJsonbType())
 	case *big.Rat:
 		switch LossOfPrecisionHandling {
 		case NumericError:
@@ -3385,6 +5001,56 @@ func encodeValue(v interface{}) (*proto3.Value, *sppb.Type, error) {
 			}
 		}
 		pt = listType(dateType())
+	case uuid.UUID:
+		pb.Kind = stringKind(v.String())
+		pt = uuidType()
+	case []uuid.UUID:
+		if v != nil {
+			pb, err = encodeArray(len(v), func(i int) interface{} { return v[i] })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		pt = listType(uuidType())
+	case []*uuid.UUID:
+		if v != nil {
+			pb, err = encodeArray(len(v), func(i int) interface{} { return v[i] })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		pt = listType(uuidType())
+	case NullUUID:
+		if v.Valid {
+			return encodeValue(v.UUID)
+		}
+		pt = uuidType()
+	case []NullUUID:
+		if v != nil {
+			pb, err = encodeArray(len(v), func(i int) interface{} { return v[i] })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		pt = listType(uuidType())
+	case uuid.NullUUID:
+		nullUUID := NullUUID{UUID: v.UUID, Valid: v.Valid}
+		return encodeValue(nullUUID)
+	case *uuid.UUID:
+		if v != nil {
+			return encodeValue(*v)
+		}
+		pt = uuidType()
+	case *NullUUID:
+		if v != nil {
+			return encodeValue(*v)
+		}
+		pt = uuidType()
+	case *uuid.NullUUID:
+		if v != nil {
+			return encodeValue(*v)
+		}
+		pt = uuidType()
 	case GenericColumnValue:
 		// Deep clone to ensure subsequent changes to v before
 		// transmission don't affect our encoded value.
@@ -3392,6 +5058,61 @@ func encodeValue(v interface{}) (*proto3.Value, *sppb.Type, error) {
 		pt = proto.Clone(v.Type).(*sppb.Type)
 	case []GenericColumnValue:
 		return nil, nil, errEncoderUnsupportedType(v)
+	case protoreflect.Enum:
+		// Check if the value is of protoreflect.Enum type that implements spanner.Encoder
+		// interface.
+		if encodedVal, ok := v.(Encoder); ok {
+			nv, err := encodedVal.EncodeSpanner()
+			if err != nil {
+				return nil, nil, err
+			}
+			return encodeValue(nv)
+		}
+
+		if v != nil {
+			var protoEnumfqn string
+			rv := reflect.ValueOf(v)
+			if rv.Kind() != reflect.Ptr || !rv.IsNil() {
+				pb.Kind = stringKind(strconv.FormatInt(int64(v.Number()), 10))
+				protoEnumfqn = string(v.Descriptor().FullName())
+			} else {
+				defaultType := reflect.Zero(rv.Type().Elem()).Interface().(protoreflect.Enum)
+				protoEnumfqn = string(defaultType.Descriptor().FullName())
+			}
+			pt = protoEnumType(protoEnumfqn)
+		}
+	case NullProtoEnum:
+		if v.Valid {
+			return encodeValue(v.ProtoEnumVal)
+		}
+		return nil, nil, errNotValidSrc(v)
+	case proto.Message:
+		// Check if the value is of proto.Message type that implements spanner.Encoder
+		// interface.
+		if encodedVal, ok := v.(Encoder); ok {
+			nv, err := encodedVal.EncodeSpanner()
+			if err != nil {
+				return nil, nil, err
+			}
+			return encodeValue(nv)
+		}
+
+		if v != nil {
+			if v.ProtoReflect().IsValid() {
+				bytes, err := proto.Marshal(v)
+				if err != nil {
+					return nil, nil, err
+				}
+				pb.Kind = stringKind(base64.StdEncoding.EncodeToString(bytes))
+			}
+			protoMessagefqn := string(v.ProtoReflect().Descriptor().FullName())
+			pt = protoMessageType(protoMessagefqn)
+		}
+	case NullProtoMessage:
+		if v.Valid {
+			return encodeValue(v.ProtoMessageVal)
+		}
+		return nil, nil, errNotValidSrc(v)
 	default:
 		// Check if the value is a custom type that implements spanner.Encoder
 		// interface.
@@ -3413,7 +5134,7 @@ func encodeValue(v interface{}) (*proto3.Value, *sppb.Type, error) {
 			return encodeValue(converted)
 		}
 
-		if !isStructOrArrayOfStructValue(v) {
+		if !isStructOrArrayOfStructValue(v) && !isAnArrayOfProtoColumn(v) {
 			return nil, nil, errEncoderUnsupportedType(v)
 		}
 		typ := reflect.TypeOf(v)
@@ -3426,6 +5147,9 @@ func encodeValue(v interface{}) (*proto3.Value, *sppb.Type, error) {
 
 		// Value is a slice of Go struct values/ptrs.
 		if typ.Kind() == reflect.Slice {
+			if isAnArrayOfProtoColumn(v) {
+				return encodeProtoArray(v)
+			}
 			return encodeStructArray(v)
 		}
 	}
@@ -3438,7 +5162,7 @@ func convertCustomTypeValue(sourceType decodableSpannerType, v interface{}) (int
 	var destination reflect.Value
 	switch sourceType {
 	case spannerTypeInvalid:
-		return nil, fmt.Errorf("cannot encode a value to type spannerTypeInvalid")
+		return nil, errors.New("cannot encode a value to type spannerTypeInvalid")
 	case spannerTypeNonNullString:
 		destination = reflect.Indirect(reflect.New(reflect.TypeOf("")))
 	case spannerTypeNullString:
@@ -3462,6 +5186,10 @@ func convertCustomTypeValue(sourceType decodableSpannerType, v interface{}) (int
 		destination = reflect.Indirect(reflect.New(reflect.TypeOf(float64(0.0))))
 	case spannerTypeNullFloat64:
 		destination = reflect.Indirect(reflect.New(reflect.TypeOf(NullFloat64{})))
+	case spannerTypeNonNullFloat32:
+		destination = reflect.Indirect(reflect.New(reflect.TypeOf(float32(0.0))))
+	case spannerTypeNullFloat32:
+		destination = reflect.Indirect(reflect.New(reflect.TypeOf(NullFloat32{})))
 	case spannerTypeNonNullTime:
 		destination = reflect.Indirect(reflect.New(reflect.TypeOf(time.Time{})))
 	case spannerTypeNullTime:
@@ -3476,6 +5204,14 @@ func convertCustomTypeValue(sourceType decodableSpannerType, v interface{}) (int
 		destination = reflect.Indirect(reflect.New(reflect.TypeOf(NullNumeric{})))
 	case spannerTypeNullJSON:
 		destination = reflect.Indirect(reflect.New(reflect.TypeOf(NullJSON{})))
+	case spannerTypePGJsonB:
+		destination = reflect.Indirect(reflect.New(reflect.TypeOf(PGJsonB{})))
+	case spannerTypePGNumeric:
+		destination = reflect.Indirect(reflect.New(reflect.TypeOf(PGNumeric{})))
+	case spannerTypeNonNullUUID:
+		destination = reflect.Indirect(reflect.New(reflect.TypeOf(uuid.UUID{})))
+	case spannerTypeNullUUID:
+		destination = reflect.Indirect(reflect.New(reflect.TypeOf(NullUUID{})))
 	case spannerTypeArrayOfNonNullString:
 		if reflect.ValueOf(v).IsNil() {
 			return []string(nil), nil
@@ -3521,6 +5257,16 @@ func convertCustomTypeValue(sourceType decodableSpannerType, v interface{}) (int
 			return []NullFloat64(nil), nil
 		}
 		destination = reflect.MakeSlice(reflect.TypeOf([]NullFloat64{}), reflect.ValueOf(v).Len(), reflect.ValueOf(v).Cap())
+	case spannerTypeArrayOfNonNullFloat32:
+		if reflect.ValueOf(v).IsNil() {
+			return []float32(nil), nil
+		}
+		destination = reflect.MakeSlice(reflect.TypeOf([]float32{}), reflect.ValueOf(v).Len(), reflect.ValueOf(v).Cap())
+	case spannerTypeArrayOfNullFloat32:
+		if reflect.ValueOf(v).IsNil() {
+			return []NullFloat32(nil), nil
+		}
+		destination = reflect.MakeSlice(reflect.TypeOf([]NullFloat32{}), reflect.ValueOf(v).Len(), reflect.ValueOf(v).Cap())
 	case spannerTypeArrayOfNonNullTime:
 		if reflect.ValueOf(v).IsNil() {
 			return []time.Time(nil), nil
@@ -3556,6 +5302,36 @@ func convertCustomTypeValue(sourceType decodableSpannerType, v interface{}) (int
 			return []NullJSON(nil), nil
 		}
 		destination = reflect.MakeSlice(reflect.TypeOf([]NullJSON{}), reflect.ValueOf(v).Len(), reflect.ValueOf(v).Cap())
+	case spannerTypeArrayOfPGJsonB:
+		if reflect.ValueOf(v).IsNil() {
+			return []PGJsonB(nil), nil
+		}
+		destination = reflect.MakeSlice(reflect.TypeOf([]PGJsonB{}), reflect.ValueOf(v).Len(), reflect.ValueOf(v).Cap())
+	case spannerTypeArrayOfPGNumeric:
+		if reflect.ValueOf(v).IsNil() {
+			return []PGNumeric(nil), nil
+		}
+		destination = reflect.MakeSlice(reflect.TypeOf([]PGNumeric{}), reflect.ValueOf(v).Len(), reflect.ValueOf(v).Cap())
+	case spannerTypeArrayOfNonNullInterval:
+		if reflect.ValueOf(v).IsNil() {
+			return []Interval(nil), nil
+		}
+		destination = reflect.MakeSlice(reflect.TypeOf([]Interval{}), reflect.ValueOf(v).Len(), reflect.ValueOf(v).Cap())
+	case spannerTypeArrayOfNullInterval:
+		if reflect.ValueOf(v).IsNil() {
+			return []NullInterval(nil), nil
+		}
+		destination = reflect.MakeSlice(reflect.TypeOf([]NullInterval{}), reflect.ValueOf(v).Len(), reflect.ValueOf(v).Cap())
+	case spannerTypeArrayOfNonNullUUID:
+		if reflect.ValueOf(v).IsNil() {
+			return []uuid.UUID{}, nil
+		}
+		destination = reflect.MakeSlice(reflect.TypeOf([]uuid.UUID{}), reflect.ValueOf(v).Len(), reflect.ValueOf(v).Cap())
+	case spannerTypeArrayOfNullUUID:
+		if reflect.ValueOf(v).IsNil() {
+			return []NullUUID(nil), nil
+		}
+		destination = reflect.MakeSlice(reflect.TypeOf([]NullUUID{}), reflect.ValueOf(v).Len(), reflect.ValueOf(v).Cap())
 	default:
 		// This should not be possible.
 		return nil, fmt.Errorf("unknown decodable type found: %v", sourceType)
@@ -3672,6 +5448,42 @@ func encodeStructArray(v interface{}) (*proto3.Value, *sppb.Type, error) {
 	return listProto(values...), listType(elemTyp), nil
 }
 
+// Encodes a slice of proto messages or enum in v to the spanner Value and Type
+// protos.
+func encodeProtoArray(v interface{}) (*proto3.Value, *sppb.Type, error) {
+	pb := nullProto()
+	var pt *sppb.Type
+	var err error
+	sliceval := reflect.ValueOf(v)
+	etyp := reflect.TypeOf(v).Elem()
+
+	if etyp.Implements(protoMsgReflectType) {
+		if !sliceval.IsNil() {
+			pb, err = encodeProtoMessageArray(sliceval.Len(), func(i int) reflect.Value { return sliceval.Index(i) })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		defaultInstance := reflect.Zero(etyp).Interface().(proto.Message)
+		protoMessagefqn := string(defaultInstance.ProtoReflect().Descriptor().FullName())
+		pt = listType(protoMessageType(protoMessagefqn))
+	} else if etyp.Implements(protoEnumReflectType) {
+		if !sliceval.IsNil() {
+			pb, err = encodeProtoEnumArray(sliceval.Len(), func(i int) reflect.Value { return sliceval.Index(i) })
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+		if etyp.Kind() == reflect.Ptr {
+			etyp = etyp.Elem()
+		}
+		defaultInstance := reflect.Zero(etyp).Interface().(protoreflect.Enum)
+		protoEnumfqn := string(defaultInstance.Descriptor().FullName())
+		pt = listType(protoEnumType(protoEnumfqn))
+	}
+	return pb, pt, nil
+}
+
 func isStructOrArrayOfStructValue(v interface{}) bool {
 	typ := reflect.TypeOf(v)
 	if typ.Kind() == reflect.Slice {
@@ -3683,6 +5495,17 @@ func isStructOrArrayOfStructValue(v interface{}) bool {
 	return typ.Kind() == reflect.Struct
 }
 
+func isAnArrayOfProtoColumn(v interface{}) bool {
+	typ := reflect.TypeOf(v)
+	if typ.Kind() == reflect.Ptr {
+		typ = typ.Elem()
+	}
+	if typ.Kind() == reflect.Slice {
+		typ = typ.Elem()
+	}
+	return typ.Implements(protoMsgReflectType) || typ.Implements(protoEnumReflectType)
+}
+
 func isSupportedMutationType(v interface{}) bool {
 	switch v.(type) {
 	case nil, string, *string, NullString, []string, []*string, []NullString,
@@ -3690,14 +5513,20 @@ func isSupportedMutationType(v interface{}) bool {
 		int, []int, int64, *int64, []int64, []*int64, NullInt64, []NullInt64,
 		bool, *bool, []bool, []*bool, NullBool, []NullBool,
 		float64, *float64, []float64, []*float64, NullFloat64, []NullFloat64,
+		float32, *float32, []float32, []*float32, NullFloat32, []NullFloat32,
 		time.Time, *time.Time, []time.Time, []*time.Time, NullTime, []NullTime,
 		civil.Date, *civil.Date, []civil.Date, []*civil.Date, NullDate, []NullDate,
-		big.Rat, *big.Rat, []big.Rat, []*big.Rat, NullNumeric, []NullNumeric,
-		GenericColumnValue:
+		big.Rat, *big.Rat, []big.Rat, []*big.Rat, NullNumeric, []NullNumeric, uuid.UUID, []uuid.UUID, *uuid.UUID, []*uuid.UUID, NullUUID, []NullUUID,
+		Interval, *Interval, []Interval, []*Interval, NullInterval, []NullInterval,
+		GenericColumnValue, proto.Message, protoreflect.Enum, NullProtoMessage, NullProtoEnum:
 		return true
 	default:
 		// Check if the custom type implements spanner.Encoder interface.
 		if _, ok := v.(Encoder); ok {
+			return true
+		}
+
+		if isAnArrayOfProtoColumn(v) {
 			return true
 		}
 
@@ -3737,12 +5566,56 @@ func encodeArray(len int, at func(int) interface{}) (*proto3.Value, error) {
 	return listProto(vs...), nil
 }
 
+func encodeProtoMessageArray(len int, at func(int) reflect.Value) (*proto3.Value, error) {
+	vs := make([]*proto3.Value, len)
+	var err error
+	for i := 0; i < len; i++ {
+		v := at(i).Interface().(proto.Message)
+		vs[i], _, err = encodeValue(v)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return listProto(vs...), nil
+}
+
+func encodeProtoEnumArray(len int, at func(int) reflect.Value) (*proto3.Value, error) {
+	vs := make([]*proto3.Value, len)
+	var err error
+	for i := 0; i < len; i++ {
+		v := at(i).Interface().(protoreflect.Enum)
+		vs[i], _, err = encodeValue(v)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return listProto(vs...), nil
+}
+
+// spannerTag contains metadata about a struct field's spanner tag.
+type spannerTag struct {
+	// ReadOnly is true if the field should be excluded from writes (read-only).
+	ReadOnly bool
+}
+
 func spannerTagParser(t reflect.StructTag) (name string, keep bool, other interface{}, err error) {
 	if s := t.Get("spanner"); s != "" {
 		if s == "-" {
 			return "", false, nil, nil
 		}
-		return s, true, nil, nil
+		if s == "->" {
+			tag := spannerTag{ReadOnly: true}
+			return "", true, tag, nil
+		}
+		parts := strings.Split(s, ";")
+		name = parts[0]
+		tag := spannerTag{}
+		for _, part := range parts[1:] {
+			if part == "->" || strings.ToLower(part) == "readonly" {
+				tag.ReadOnly = true
+			}
+		}
+		return name, true, tag, nil
 	}
 	return "", true, nil, nil
 }
@@ -3755,4 +5628,346 @@ func trimDoubleQuotes(payload []byte) ([]byte, error) {
 	}
 	// Remove the double quotes at the beginning and the end.
 	return payload[1 : len(payload)-1], nil
+}
+
+// Interval represents a Spanner INTERVAL type that may be NULL.
+// An interval is a combination of months, days and nanoseconds.
+// Internally, Spanner supports Interval value with the following range of individual fields:
+// months: [-120000, 120000]
+// days: [-3660000, 3660000]
+// nanoseconds: [-316224000000000000000, 316224000000000000000]
+type Interval struct {
+	Months int32    // Months component of the interval
+	Days   int32    // Days component of the interval
+	Nanos  *big.Int // Nanoseconds component of the interval
+}
+
+// NullInterval represents a Spanner INTERVAL that may be NULL.
+type NullInterval struct {
+	Interval Interval // Interval contains the value when it is non-NULL
+	Valid    bool     // Valid is true if Interval is not NULL
+}
+
+// IsNull implements NullableValue.IsNull for NullInterval.
+func (n NullInterval) IsNull() bool {
+	return !n.Valid
+}
+
+// String implements Stringer.String for NullInterval.
+func (n NullInterval) String() string {
+	if !n.Valid {
+		return nullString
+	}
+	return n.Interval.String()
+}
+
+// String returns the ISO8601 duration format string representation of the interval.
+func (i Interval) String() string {
+	var result strings.Builder
+	result.WriteString("P")
+
+	years := i.Months / 12
+	months := i.Months % 12
+	if years != 0 {
+		result.WriteString(fmt.Sprintf("%dY", years))
+	}
+	if months != 0 {
+		result.WriteString(fmt.Sprintf("%dM", months))
+	}
+
+	// Handle days
+	if i.Days != 0 {
+		result.WriteString(fmt.Sprintf("%dD", i.Days))
+	}
+
+	if i.Nanos != nil && i.Nanos.Sign() != 0 {
+		result.WriteString("T")
+		nanos := new(big.Int).Set(i.Nanos)
+		isNegative := nanos.Sign() < 0
+		if isNegative {
+			nanos.Neg(nanos)
+		}
+
+		nanosPerHour := new(big.Int).SetInt64(3600000000000)
+		hours := new(big.Int).Div(nanos, nanosPerHour)
+		if hours.Sign() != 0 {
+			if isNegative {
+				result.WriteString("-")
+			}
+			result.WriteString(fmt.Sprintf("%sH", hours.String()))
+		}
+		nanos.Mod(nanos, nanosPerHour)
+
+		nanosPerMinute := new(big.Int).SetInt64(60000000000)
+		minutes := new(big.Int).Div(nanos, nanosPerMinute)
+		if minutes.Sign() != 0 {
+			if isNegative {
+				result.WriteString("-")
+			}
+			result.WriteString(fmt.Sprintf("%sM", minutes.String()))
+		}
+		nanos.Mod(nanos, nanosPerMinute)
+
+		nanosPerSecond := new(big.Int).SetInt64(1000000000)
+		seconds := new(big.Int).Div(nanos, nanosPerSecond)
+		nanosFraction := new(big.Int).Mod(nanos, nanosPerSecond)
+
+		if seconds.Sign() != 0 || nanosFraction.Sign() != 0 {
+			if isNegative {
+				result.WriteString("-")
+			}
+			if seconds.Sign() != 0 {
+				result.WriteString(seconds.String())
+			} else if nanosFraction.Sign() != 0 {
+				result.WriteString("0")
+			}
+			if nanosFraction.Sign() != 0 {
+				absNanos := new(big.Int)
+				absNanos.Abs(nanosFraction)
+				nanoStr := fmt.Sprintf("%09d", absNanos)
+
+				trimmed := strings.TrimRight(nanoStr, "0")
+				if len(trimmed) <= 3 {
+					for len(trimmed) < 3 {
+						trimmed += "0"
+					}
+				} else if len(trimmed) <= 6 {
+					for len(trimmed) < 6 {
+						trimmed += "0"
+					}
+				} else {
+					for len(trimmed) < 9 {
+						trimmed += "0"
+					}
+				}
+				result.WriteString("." + trimmed)
+			}
+			result.WriteString("S")
+		}
+	}
+
+	if result.Len() == 1 {
+		result.WriteString("0Y") // Special case for zero interval
+	}
+
+	return result.String()
+}
+
+// MarshalJSON implements json.Marshaler.MarshalJSON for NullInterval.
+func (n NullInterval) MarshalJSON() ([]byte, error) {
+	if !n.Valid {
+		return []byte("null"), nil
+	}
+	return json.Marshal(n.Interval.String())
+}
+
+// UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON for NullInterval.
+func (n *NullInterval) UnmarshalJSON(payload []byte) error {
+	if payload == nil {
+		return errPayloadNil
+	}
+
+	if jsonIsNull(payload) {
+		n.Valid = false
+		return nil
+	}
+
+	var s string
+	if err := json.Unmarshal(payload, &s); err != nil {
+		return err
+	}
+
+	interval, err := ParseInterval(s)
+	if err != nil {
+		return err
+	}
+
+	n.Interval = interval
+	n.Valid = true
+	return nil
+}
+
+// ParseInterval parses an ISO8601 duration format string into an Interval.
+func ParseInterval(s string) (Interval, error) {
+	var interval Interval
+	interval.Nanos = new(big.Int)
+
+	pattern := `^P(-?\d+Y)?(-?\d+M)?(-?\d+D)?(T(-?\d+H)?(-?\d+M)?(-?((\d+([.,]\d{1,9})?)|([.,]\d{1,9}))S)?)?$`
+	re := regexp.MustCompile(pattern)
+
+	if !re.MatchString(s) {
+		return Interval{}, fmt.Errorf("invalid interval format: %s", s)
+	}
+
+	parts := re.FindStringSubmatch(s)
+	if parts == nil {
+		return Interval{}, fmt.Errorf("invalid interval format: %s", s)
+	}
+
+	if len(s) == 1 {
+		return Interval{}, fmt.Errorf("invalid interval format: at least one component (Y/M/D/H/M/S) is required: %s", s)
+	}
+
+	// Verify that at least one component is present (Y, M, D, H, M, or S)
+	if parts[1] == "" && parts[2] == "" && parts[3] == "" && parts[4] == "" {
+		return Interval{}, fmt.Errorf("invalid interval format: at least one component (Y/M/D/H/M/S) is required: %s", s)
+	}
+
+	if parts[4] == "T" && parts[5] == "" && parts[6] == "" && parts[7] == "" {
+		return Interval{}, fmt.Errorf("invalid interval format: time designator 'T' present but no time components specified: %s", s)
+	}
+
+	var parseNum = func(s string, suffix string) int64 {
+		if s == "" {
+			return 0
+		}
+		s = strings.TrimSuffix(s, suffix)
+
+		num, _ := strconv.ParseInt(s, 10, 64)
+		return num
+	}
+
+	years := parseNum(parts[1], "Y")
+	months := parseNum(parts[2], "M")
+	interval.Months = int32(years*12 + months)
+
+	interval.Days = int32(parseNum(parts[3], "D"))
+
+	if parts[4] != "" { // Has time component
+		// Convert hours to nanoseconds
+		hours := parseNum(parts[5], "H")
+		hoursStr := strconv.FormatInt(hours, 10)
+		hoursValue := new(big.Int)
+		hoursValue.SetString(hoursStr, 10)
+
+		nanosPerHour := new(big.Int)
+		nanosPerHour.SetString("3600000000000", 10)
+
+		hoursNanos := new(big.Int)
+		hoursNanos.Mul(nanosPerHour, hoursValue)
+		interval.Nanos = hoursNanos
+
+		minutes := parseNum(parts[6], "M")
+		minutesNanos := new(big.Int).SetInt64(minutes * 60000000000)
+		interval.Nanos.Add(interval.Nanos, minutesNanos)
+
+		if parts[7] != "" {
+			seconds := strings.TrimSuffix(parts[7], "S")
+
+			if strings.Contains(seconds, ",") {
+				seconds = strings.Replace(seconds, ",", ".", 1)
+			}
+
+			secondsParts := strings.Split(seconds, ".")
+			var secondsInt int64
+			var fractionStr string
+
+			if len(secondsParts) == 1 {
+				if strings.HasPrefix(seconds, ".") {
+					fractionStr = secondsParts[0]
+				} else {
+					secondsInt, _ = strconv.ParseInt(secondsParts[0], 10, 64)
+				}
+			} else if len(secondsParts) == 2 {
+				secondsInt, _ = strconv.ParseInt(secondsParts[0], 10, 64)
+				fractionStr = secondsParts[1]
+			}
+
+			secondsNanos := new(big.Int).SetInt64(secondsInt * 1000000000)
+			interval.Nanos.Add(interval.Nanos, secondsNanos)
+
+			if fractionStr != "" {
+				for len(fractionStr) < 9 {
+					fractionStr += "0"
+				}
+				if len(fractionStr) > 9 {
+					fractionStr = fractionStr[:9]
+				}
+
+				fractionalNanos, _ := strconv.ParseInt(fractionStr, 10, 64)
+				if strings.HasPrefix(seconds, "-") {
+					fractionalNanos = -fractionalNanos
+				}
+				interval.Nanos.Add(interval.Nanos, big.NewInt(fractionalNanos))
+			}
+		}
+	}
+
+	return interval, nil
+}
+
+// Value implements the driver.Valuer interface for NullInterval.
+func (n NullInterval) Value() (driver.Value, error) {
+	if !n.Valid {
+		return nil, nil
+	}
+	return n.String(), nil
+}
+
+// Scan implements the sql.Scanner interface for NullInterval.
+func (n *NullInterval) Scan(value interface{}) error {
+	if value == nil {
+		n.Interval, n.Valid = Interval{}, false
+		return nil
+	}
+
+	switch v := value.(type) {
+	case string:
+		interval, err := ParseInterval(v)
+		if err != nil {
+			return err
+		}
+		n.Interval = interval
+		n.Valid = true
+		return nil
+	default:
+		return fmt.Errorf("cannot convert %v (%T) to Interval", value, value)
+	}
+}
+
+// GormDataType implements the gorm.GormDataTypeInterface interface for NullInterval.
+func (n NullInterval) GormDataType() string {
+	return "INTERVAL"
+}
+
+// decodeIntervalArray decodes proto3.ListValue pb into a Interval slice.
+func decodeIntervalArray(pb *proto3.ListValue) ([]Interval, error) {
+	if pb == nil {
+		return nil, errNilListValue("INTERVAL")
+	}
+	a := make([]Interval, len(pb.Values))
+	for i, v := range pb.Values {
+		if err := decodeValue(v, intervalType(), &a[i]); err != nil {
+			return nil, errDecodeArrayElement(i, v, "INTERVAL", err)
+		}
+	}
+	return a, nil
+}
+
+// decodeNullIntervalArray decodes proto3.ListValue pb into a NullInterval slice.
+func decodeNullIntervalArray(pb *proto3.ListValue) ([]NullInterval, error) {
+	if pb == nil {
+		return nil, errNilListValue("INTERVAL")
+	}
+	a := make([]NullInterval, len(pb.Values))
+	for i, v := range pb.Values {
+		if err := decodeValue(v, intervalType(), &a[i]); err != nil {
+			return nil, errDecodeArrayElement(i, v, "INTERVAL", err)
+		}
+	}
+	return a, nil
+}
+
+// decodeIntervalPointerArray decodes proto3.ListValue pb into a *Interval slice.
+func decodeIntervalPointerArray(pb *proto3.ListValue) ([]*Interval, error) {
+	if pb == nil {
+		return nil, errNilListValue("INTERVAL")
+	}
+	a := make([]*Interval, len(pb.Values))
+	for i, v := range pb.Values {
+		if err := decodeValue(v, intervalType(), &a[i]); err != nil {
+			return nil, errDecodeArrayElement(i, v, "INTERVAL", err)
+		}
+	}
+	return a, nil
 }

@@ -23,9 +23,11 @@ import (
 	"time"
 
 	"cloud.google.com/go/civil"
-	proto3 "github.com/golang/protobuf/ptypes/struct"
-	sppb "google.golang.org/genproto/googleapis/spanner/v1"
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
+	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	proto3 "google.golang.org/protobuf/types/known/structpb"
 )
 
 // A Key can be either a Cloud Spanner row's primary key or a secondary index
@@ -58,6 +60,7 @@ import (
 //   - string and NullString are mapped to Cloud Spanner's STRING type.
 //   - time.Time and NullTime are mapped to Cloud Spanner's TIMESTAMP type.
 //   - civil.Date and NullDate are mapped to Cloud Spanner's DATE type.
+//   - protoreflect.Enum and NullProtoEnum are mapped to Cloud Spanner's ENUM type.
 type Key []interface{}
 
 // errInvdKeyPartType returns error for unsupported key part type.
@@ -83,9 +86,7 @@ func keyPartValue(part interface{}) (pb *proto3.Value, err error) {
 		pb, _, err = encodeValue(int64(v))
 	case uint32:
 		pb, _, err = encodeValue(int64(v))
-	case float32:
-		pb, _, err = encodeValue(float64(v))
-	case int64, float64, NullInt64, NullFloat64, bool, NullBool, []byte, string, NullString, time.Time, civil.Date, NullTime, NullDate, big.Rat, NullNumeric:
+	case int64, float64, float32, NullInt64, NullFloat64, NullFloat32, bool, NullBool, []byte, string, NullString, time.Time, civil.Date, NullTime, NullDate, big.Rat, NullNumeric, protoreflect.Enum, NullProtoEnum, uuid.UUID, uuid.NullUUID, NullUUID:
 		pb, _, err = encodeValue(v)
 	case Encoder:
 		part, err = v.EncodeSpanner()
@@ -140,7 +141,7 @@ func (key Key) String() string {
 
 func (key Key) elemString(b *bytes.Buffer, part interface{}) {
 	switch v := part.(type) {
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, float32, float64, bool:
+	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, float32, float64, bool, protoreflect.Enum:
 		// Use %v to print numeric types and bool.
 		fmt.Fprintf(b, "%v", v)
 	case string:
@@ -151,7 +152,7 @@ func (key Key) elemString(b *bytes.Buffer, part interface{}) {
 		} else {
 			fmt.Fprint(b, nullString)
 		}
-	case NullInt64, NullFloat64, NullBool, NullNumeric:
+	case NullInt64, NullFloat64, NullBool, NullNumeric, NullProtoEnum:
 		// The above types implement fmt.Stringer.
 		fmt.Fprintf(b, "%s", v)
 	case NullString, NullDate, NullTime:
@@ -167,6 +168,14 @@ func (key Key) elemString(b *bytes.Buffer, part interface{}) {
 		fmt.Fprintf(b, "%q", v.Format(time.RFC3339Nano))
 	case big.Rat:
 		fmt.Fprintf(b, "%v", NumericString(&v))
+	case uuid.UUID:
+		fmt.Fprintf(b, "%s", v.String())
+	case uuid.NullUUID:
+		if !v.Valid {
+			fmt.Fprintf(b, "%s", nullString)
+		} else {
+			fmt.Fprintf(b, "%s", v.UUID.String())
+		}
 	case Encoder:
 		var err error
 		part, err = v.EncodeSpanner()
@@ -235,10 +244,10 @@ const (
 // the following range returns all events for user "Bob" that occurred in the
 // year 2015:
 //
-// 	spanner.KeyRange{
+//	spanner.KeyRange{
 //		Start: spanner.Key{"Bob", "2015-01-01"},
 //		End:   spanner.Key{"Bob", "2015-12-31"},
-//		Kind:  ClosedClosed,
+//		Kind:  spanner.ClosedClosed,
 //	}
 //
 // Start and end keys can omit trailing key components. This affects the
@@ -254,7 +263,7 @@ const (
 //	spanner.KeyRange{
 //		Start: spanner.Key{"Bob", "2000-01-01"},
 //		End:   spanner.Key{"Bob"},
-//		Kind:  ClosedClosed,
+//		Kind:  spanner.ClosedClosed,
 //	}
 //
 // The next example retrieves all events for "Bob":
@@ -266,7 +275,7 @@ const (
 //	spanner.KeyRange{
 //		Start: spanner.Key{"Bob"},
 //		End:   spanner.Key{"Bob", "2000-01-01"},
-//		Kind:  ClosedOpen,
+//		Kind:  spanner.ClosedOpen,
 //	}
 //
 // Although we specified a Kind for this KeyRange, we didn't need to, because
@@ -307,7 +316,7 @@ const (
 //	spanner.KeyRange{
 //		Start: spanner.Key{100},
 //		End:   spanner.Key{1},
-//		Kind:  ClosedClosed,
+//		Kind:  spanner.ClosedClosed,
 //	}
 //
 // Note that 100 is passed as the start, and 1 is passed as the end, because

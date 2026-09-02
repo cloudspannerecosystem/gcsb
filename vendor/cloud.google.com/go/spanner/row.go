@@ -17,12 +17,14 @@ limitations under the License.
 package spanner
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 
-	proto3 "github.com/golang/protobuf/ptypes/struct"
-	sppb "google.golang.org/genproto/googleapis/spanner/v1"
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"google.golang.org/grpc/codes"
+	proto3 "google.golang.org/protobuf/types/known/structpb"
 )
 
 // A Row is a view of a row of data returned by a Cloud Spanner read.
@@ -56,6 +58,8 @@ import (
 //	*[]int64, *[]NullInt64 - INT64 ARRAY
 //	*bool(not NULL), *NullBool - BOOL
 //	*[]bool, *[]NullBool - BOOL ARRAY
+//	*float32(not NULL), *NullFloat32 - FLOAT32
+//	*[]float32, *[]NullFloat32 - FLOAT32 ARRAY
 //	*float64(not NULL), *NullFloat64 - FLOAT64
 //	*[]float64, *[]NullFloat64 - FLOAT64 ARRAY
 //	*big.Rat(not NULL), *NullNumeric - NUMERIC
@@ -64,7 +68,11 @@ import (
 //	*[]time.Time, *[]NullTime - TIMESTAMP ARRAY
 //	*Date(not NULL), *NullDate - DATE
 //	*[]civil.Date, *[]NullDate - DATE ARRAY
+//	*uuid.UUID(not NULL), *NullUuid - UUID
+//	*[]uuid.UUID, *[]NullUuid - UUID Array
 //	*[]*some_go_struct, *[]NullRow - STRUCT ARRAY
+//	*NullJSON - JSON
+//	*[]NullJSON - JSON ARRAY
 //	*GenericColumnValue - any Cloud Spanner type
 //
 // For TIMESTAMP columns, the returned time.Time object will be in UTC.
@@ -172,6 +180,22 @@ func (r *Row) ColumnNames() []string {
 	return n
 }
 
+// ColumnType returns the Cloud Spanner Type of column i, or nil for invalid column.
+func (r *Row) ColumnType(i int) *sppb.Type {
+	if i < 0 || i >= len(r.fields) {
+		return nil
+	}
+	return r.fields[i].Type
+}
+
+// ColumnValue returns the Cloud Spanner Value of column i, or nil for invalid column.
+func (r *Row) ColumnValue(i int) *proto3.Value {
+	if i < 0 || i >= len(r.vals) {
+		return nil
+	}
+	return r.vals[i]
+}
+
 // errColIdxOutOfRange returns error for requested column index is out of the
 // range of the target Row's columns.
 func errColIdxOutOfRange(i int, r *Row) error {
@@ -184,7 +208,7 @@ func errDecodeColumn(i int, err error) error {
 		return nil
 	}
 	var se *Error
-	if !errorAs(err, &se) {
+	if !errors.As(err, &se) {
 		return spannerErrorf(codes.InvalidArgument, "failed to decode column %v, error = <%v>", i, err)
 	}
 	se.decorate(fmt.Sprintf("failed to decode column %v", i))
@@ -229,6 +253,18 @@ func errDupColName(n string) error {
 // errColNotFound returns error for not being able to find a named column.
 func errColNotFound(n string) error {
 	return spannerErrorf(codes.NotFound, "column %q not found", n)
+}
+
+func errNotASlicePointer() error {
+	return spannerErrorf(codes.InvalidArgument, "destination must be a pointer to a slice")
+}
+
+func errNilSlicePointer() error {
+	return spannerErrorf(codes.InvalidArgument, "destination must be a non nil pointer")
+}
+
+func errTooManyColumns() error {
+	return spannerErrorf(codes.InvalidArgument, "too many columns returned for primitive slice")
 }
 
 // ColumnByName fetches the value from the named column, decoding it into ptr.
@@ -281,16 +317,16 @@ func errToStructArgType(p interface{}) error {
 // The rules for mapping a row's columns into a struct's exported fields
 // are:
 //
-//   1. If a field has a `spanner: "column_name"` tag, then decode column
-//      'column_name' into the field. A special case is the `spanner: "-"`
-//      tag, which instructs ToStruct to ignore the field during decoding.
+//  1. If a field has a `spanner: "column_name"` tag, then decode column
+//     'column_name' into the field. A special case is the `spanner: "-"`
+//     tag, which instructs ToStruct to ignore the field during decoding.
 //
-//   2. Otherwise, if the name of a field matches the name of a column (ignoring case),
-//      decode the column into the field.
+//  2. Otherwise, if the name of a field matches the name of a column (ignoring case),
+//     decode the column into the field.
 //
-//   3. The number of columns in the row must match the number of exported fields in the struct.
-//      There must be exactly one match for each column in the row. The method will return an error
-//      if a column in the row cannot be assigned to a field in the struct.
+//  3. The number of columns in the row must match the number of exported fields in the struct.
+//     There must be exactly one match for each column in the row. The method will return an error
+//     if a column in the row cannot be assigned to a field in the struct.
 //
 // The fields of the destination struct can be of any type that is acceptable
 // to spanner.Row.Column.
@@ -323,16 +359,16 @@ func (r *Row) ToStruct(p interface{}) error {
 // The rules for mapping a row's columns into a struct's exported fields
 // are:
 //
-//   1. If a field has a `spanner: "column_name"` tag, then decode column
-//      'column_name' into the field. A special case is the `spanner: "-"`
-//      tag, which instructs ToStruct to ignore the field during decoding.
+//  1. If a field has a `spanner: "column_name"` tag, then decode column
+//     'column_name' into the field. A special case is the `spanner: "-"`
+//     tag, which instructs ToStruct to ignore the field during decoding.
 //
-//   2. Otherwise, if the name of a field matches the name of a column (ignoring case),
-//      decode the column into the field.
+//  2. Otherwise, if the name of a field matches the name of a column (ignoring case),
+//     decode the column into the field.
 //
-//   3. The number of columns in the row and exported fields in the struct do not need to match.
-//      Any field in the struct that cannot not be assigned a value from the row is assigned its default value.
-//      Any column in the row that does not have a corresponding field in the struct is ignored.
+//  3. The number of columns in the row and exported fields in the struct do not need to match.
+//     Any field in the struct that cannot not be assigned a value from the row is assigned its default value.
+//     Any column in the row that does not have a corresponding field in the struct is ignored.
 //
 // The fields of the destination struct can be of any type that is acceptable
 // to spanner.Row.Column.
@@ -359,4 +395,238 @@ func (r *Row) ToStructLenient(p interface{}) error {
 		p,
 		true,
 	)
+}
+
+// SelectAll iterates all rows to the end. After iterating it closes the rows
+// and propagates any errors that could pop up with destination slice partially filled.
+// It expects that destination should be a slice. For each row, it scans data and appends it to the destination slice.
+// SelectAll supports both types of slices: slice of pointers and slice of structs or primitives by value,
+// for example:
+//
+//	type Singer struct {
+//	    ID    string
+//	    Name  string
+//	}
+//
+//	var singersByPtr []*Singer
+//	var singersByValue []Singer
+//
+// Both singersByPtr and singersByValue are valid destinations for SelectAll function.
+//
+// Add the option `spanner.WithLenient()` to instruct SelectAll to ignore additional columns in the rows that are not present in the destination struct.
+// example:
+//
+//	var singersByPtr []*Singer
+//	err := spanner.SelectAll(row, &singersByPtr, spanner.WithLenient())
+func SelectAll(rows rowIterator, destination interface{}, options ...DecodeOptions) error {
+	if rows == nil {
+		return errors.New("rows is nil")
+	}
+	if destination == nil {
+		return errors.New("destination is nil")
+	}
+	dstVal := reflect.ValueOf(destination)
+	if !dstVal.IsValid() || (dstVal.Kind() == reflect.Ptr && dstVal.IsNil()) {
+		return errNilSlicePointer()
+	}
+	if dstVal.Kind() != reflect.Ptr {
+		return errNotASlicePointer()
+	}
+	dstVal = dstVal.Elem()
+	dstType := dstVal.Type()
+	if k := dstType.Kind(); k != reflect.Slice {
+		return errNotASlicePointer()
+	}
+
+	itemType := dstType.Elem()
+	var itemByPtr bool
+	// If it's a slice of pointers to structs,
+	// we handle it the same way as it would be slice of struct by value
+	// and dereference pointers to values,
+	// because eventually we work with fields.
+	// But if it's a slice of primitive type e.g. or []string or []*string,
+	// we must leave and pass elements as is.
+	if itemType.Kind() == reflect.Ptr {
+		elementBaseTypeElem := itemType.Elem()
+		if elementBaseTypeElem.Kind() == reflect.Struct {
+			itemType = elementBaseTypeElem
+			itemByPtr = true
+		}
+	}
+	s := &decodeSetting{}
+	for _, opt := range options {
+		opt.Apply(s)
+	}
+
+	isPrimitive := itemType.Kind() != reflect.Struct
+	var pointers []interface{}
+	var pointerIndexes [][]int
+	var pointerLookup map[string]int
+	var orderedPointers []interface{}
+	isFirstRow := true
+	var err error
+	return rows.Do(func(row *Row) error {
+		sliceItem := reflect.New(itemType)
+		if !isPrimitive {
+			if isFirstRow {
+				defer func() {
+					isFirstRow = false
+				}()
+				if pointers, pointerIndexes, pointerLookup, err = structPointers(sliceItem.Elem(), row.fields, s.Lenient); err != nil {
+					return err
+				}
+				orderedPointers = make([]interface{}, len(pointers))
+			}
+			defer func() {
+				for _, ptr := range pointers {
+					v := reflect.ValueOf(ptr)
+					if v.IsValid() && !(v.IsNil() || v.IsZero()) {
+						e := v.Elem()
+						e.Set(reflect.Zero(e.Type()))
+					}
+				}
+			}()
+			if len(orderedPointers) != len(row.fields) {
+				orderedPointers = make([]interface{}, len(row.fields))
+			}
+			for i, col := range row.fields {
+				idx, ok := pointerLookup[strings.ToLower(col.GetName())]
+				if !ok {
+					if !s.Lenient {
+						return errNoOrDupGoField(sliceItem.Elem(), col.GetName())
+					}
+					orderedPointers[i] = nil
+					continue
+				}
+				orderedPointers[i] = pointers[idx]
+			}
+		} else if isPrimitive {
+			if len(row.fields) > 1 && !s.Lenient {
+				return errTooManyColumns()
+			}
+			pointers = []interface{}{sliceItem.Interface()}
+		}
+		var rowPointers []interface{}
+		if !isPrimitive {
+			rowPointers = orderedPointers
+		} else {
+			rowPointers = pointers
+		}
+		if len(rowPointers) == 0 {
+			return nil
+		}
+		err = row.Columns(rowPointers...)
+		if err != nil {
+			return err
+		}
+		if !isPrimitive {
+			e := sliceItem.Elem()
+			for i, p := range pointers {
+				if p == nil {
+					continue
+				}
+				indexPath := pointerIndexes[i]
+				if len(indexPath) == 0 {
+					continue
+				}
+				e.FieldByIndex(indexPath).Set(reflect.ValueOf(p).Elem())
+			}
+		}
+		var elemVal reflect.Value
+		if itemByPtr {
+			if isFirstRow {
+				// create a new pointer to the struct with all the values copied from sliceItem
+				// because same underlying pointers array will be used for next rows
+				elemVal = reflect.New(itemType)
+				elemVal.Elem().Set(sliceItem.Elem())
+			} else {
+				elemVal = sliceItem
+			}
+		} else {
+			elemVal = sliceItem.Elem()
+		}
+		dstVal.Set(reflect.Append(dstVal, elemVal))
+		return nil
+	})
+}
+
+type fieldInfo struct {
+	value     reflect.Value
+	indexPath []int
+}
+
+func structPointers(sliceItem reflect.Value, cols []*sppb.StructType_Field, lenient bool) ([]interface{}, [][]int, map[string]int, error) {
+	pointers := make([]interface{}, 0, len(cols))
+	indexes := make([][]int, 0, len(cols))
+	fieldTag := make(map[string]fieldInfo, len(cols))
+	initFieldTag(sliceItem, &fieldTag, nil)
+	lookup := make(map[string]int, len(cols))
+
+	for i, colName := range cols {
+		if colName.Name == "" {
+			return nil, nil, nil, errColNotFound(fmt.Sprintf("column %d", i))
+		}
+
+		var info fieldInfo
+		var ok bool
+		if info, ok = fieldTag[strings.ToLower(colName.GetName())]; !ok {
+			if !lenient {
+				return nil, nil, nil, errNoOrDupGoField(sliceItem, colName.GetName())
+			}
+			if structField, okField := sliceItem.Type().FieldByName(colName.GetName()); okField {
+				fieldVal := sliceItem.FieldByIndex(structField.Index)
+				if fieldVal.CanSet() {
+					info = fieldInfo{value: fieldVal, indexPath: append([]int(nil), structField.Index...)}
+				}
+			}
+		}
+
+		if !info.value.IsValid() || !info.value.CanSet() {
+			pointers = append(pointers, nil)
+			indexes = append(indexes, nil)
+			lookup[strings.ToLower(colName.GetName())] = len(pointers) - 1
+			continue
+		}
+
+		pointers = append(pointers, info.value.Addr().Interface())
+		indexes = append(indexes, info.indexPath)
+		lookup[strings.ToLower(colName.GetName())] = len(pointers) - 1
+	}
+	return pointers, indexes, lookup, nil
+}
+
+// Initialization the tags from struct.
+func initFieldTag(sliceItem reflect.Value, fieldTagMap *map[string]fieldInfo, path []int) {
+	typ := sliceItem.Type()
+
+	for i := 0; i < sliceItem.NumField(); i++ {
+		fieldType := typ.Field(i)
+		exported := (fieldType.PkgPath == "")
+		// If a named field is unexported, ignore it. An anonymous
+		// unexported field is processed, because it may contain
+		// exported fields, which are visible.
+		if !exported && !fieldType.Anonymous {
+			continue
+		}
+		currentPath := append(path, i)
+		if fieldType.Type.Kind() == reflect.Struct {
+			// found an embedded struct
+			if fieldType.Anonymous {
+				sliceItemOfAnonymous := sliceItem.Field(i)
+				initFieldTag(sliceItemOfAnonymous, fieldTagMap, currentPath)
+				continue
+			}
+		}
+		name, keep, _, _ := spannerTagParser(fieldType.Tag)
+		if !keep {
+			continue
+		}
+		if name == "" {
+			name = fieldType.Name
+		}
+		(*fieldTagMap)[strings.ToLower(name)] = fieldInfo{
+			value:     sliceItem.Field(i),
+			indexPath: append([]int(nil), currentPath...),
+		}
+	}
 }

@@ -26,85 +26,112 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
+	"sync/atomic"
 
 	"google.golang.org/grpc/attributes"
 	"google.golang.org/grpc/credentials/tls/certprovider"
 	"google.golang.org/grpc/internal"
+	"google.golang.org/grpc/internal/credentials/spiffe"
+	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/xds/matcher"
 	"google.golang.org/grpc/resolver"
 )
 
 func init() {
-	internal.GetXDSHandshakeInfoForTesting = GetHandshakeInfo
+	internal.GetXDSHandshakeInfoForTesting = HandshakeInfoFromAttributes
 }
 
 // handshakeAttrKey is the type used as the key to store HandshakeInfo in
 // the Attributes field of resolver.Address.
 type handshakeAttrKey struct{}
 
-// Equal reports whether the handshake info structs are identical (have the
-// same pointer).  This is sufficient as all subconns from one CDS balancer use
-// the same one.
-func (hi *HandshakeInfo) Equal(o interface{}) bool {
-	oh, ok := o.(*HandshakeInfo)
-	return ok && oh == hi
-}
+// hostnameKey is the type used as the key to store the hostname in the
+// Attributes field of resolver.Address.
+type hostnameKey struct{}
 
-// SetHandshakeInfo returns a copy of addr in which the Attributes field is
-// updated with hInfo.
-func SetHandshakeInfo(addr resolver.Address, hInfo *HandshakeInfo) resolver.Address {
-	addr.Attributes = addr.Attributes.WithValue(handshakeAttrKey{}, hInfo)
+// SetAddressHostname returns a copy of addr in which the Attributes field is
+// updated with the provided hostname.
+func SetAddressHostname(addr resolver.Address, hostname string) resolver.Address {
+	addr.Attributes = addr.Attributes.WithValue(hostnameKey{}, hostname)
 	return addr
 }
 
-// GetHandshakeInfo returns a pointer to the HandshakeInfo stored in attr.
-func GetHandshakeInfo(attr *attributes.Attributes) *HandshakeInfo {
+// Hostname returns the endpoint hostname stored in attr.
+func Hostname(attr *attributes.Attributes) string {
+	if attr == nil {
+		return ""
+	}
+	v := attr.Value(hostnameKey{})
+	hn, _ := v.(string)
+	return hn
+}
+
+// Equal reports whether the handshake info structs are identical.
+func (hi *HandshakeInfo) Equal(other *HandshakeInfo) bool {
+	if hi == nil && other == nil {
+		return true
+	}
+	if hi == nil || other == nil {
+		return false
+	}
+	if hi.rootProvider != other.rootProvider ||
+		hi.identityProvider != other.identityProvider ||
+		hi.requireClientCert != other.requireClientCert ||
+		hi.sni != other.sni ||
+		hi.validateSANUsingSNI != other.validateSANUsingSNI ||
+		hi.useAutoHostSNI != other.useAutoHostSNI ||
+		len(hi.sanMatchers) != len(other.sanMatchers) {
+		return false
+	}
+	for i := range hi.sanMatchers {
+		if !hi.sanMatchers[i].Equal(other.sanMatchers[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// SetHandshakeInfo returns a copy of addr in which the Attributes field is
+// updated with hiPtr.
+func SetHandshakeInfo(addr resolver.Address, hiPtr *atomic.Pointer[HandshakeInfo]) resolver.Address {
+	addr.Attributes = addr.Attributes.WithValue(handshakeAttrKey{}, hiPtr)
+	return addr
+}
+
+// HandshakeInfoFromAttributes returns a pointer to the *HandshakeInfo stored in attr.
+func HandshakeInfoFromAttributes(attr *attributes.Attributes) *atomic.Pointer[HandshakeInfo] {
 	v := attr.Value(handshakeAttrKey{})
-	hi, _ := v.(*HandshakeInfo)
+	hi, _ := v.(*atomic.Pointer[HandshakeInfo])
 	return hi
 }
 
 // HandshakeInfo wraps all the security configuration required by client and
 // server handshake methods in xds credentials. The xDS implementation will be
 // responsible for populating these fields.
-//
-// Safe for concurrent access.
 type HandshakeInfo struct {
-	mu                sync.Mutex
-	rootProvider      certprovider.Provider
-	identityProvider  certprovider.Provider
-	sanMatchers       []matcher.StringMatcher // Only on the client side.
-	requireClientCert bool                    // Only on server side.
+	// All fields written at init time and read only after that, so no
+	// synchronization needed.
+	rootProvider        certprovider.Provider
+	identityProvider    certprovider.Provider
+	sanMatchers         []matcher.StringMatcher // Only on the client side.
+	requireClientCert   bool                    // Only on server side.
+	sni                 string                  // Only on client side, used for Server Name Indication in TLS handshake.
+	validateSANUsingSNI bool                    // Only on client side, indicates whether to perform validation of SANs based on SNI value.
+	useAutoHostSNI      bool                    // Only on client side, indicates whether to use endpoint hostname as SNI.
 }
 
-// SetRootCertProvider updates the root certificate provider.
-func (hi *HandshakeInfo) SetRootCertProvider(root certprovider.Provider) {
-	hi.mu.Lock()
-	hi.rootProvider = root
-	hi.mu.Unlock()
-}
-
-// SetIdentityCertProvider updates the identity certificate provider.
-func (hi *HandshakeInfo) SetIdentityCertProvider(identity certprovider.Provider) {
-	hi.mu.Lock()
-	hi.identityProvider = identity
-	hi.mu.Unlock()
-}
-
-// SetSANMatchers updates the list of SAN matchers.
-func (hi *HandshakeInfo) SetSANMatchers(sanMatchers []matcher.StringMatcher) {
-	hi.mu.Lock()
-	hi.sanMatchers = sanMatchers
-	hi.mu.Unlock()
-}
-
-// SetRequireClientCert updates whether a client cert is required during the
-// ServerHandshake(). A value of true indicates that we are performing mTLS.
-func (hi *HandshakeInfo) SetRequireClientCert(require bool) {
-	hi.mu.Lock()
-	hi.requireClientCert = require
-	hi.mu.Unlock()
+// NewHandshakeInfo returns a new handshake info configured with the provided
+// options.
+func NewHandshakeInfo(rootProvider certprovider.Provider, identityProvider certprovider.Provider, sanMatchers []matcher.StringMatcher, requireClientCert bool, sni string, validateSANUsingSNI bool, useAutoHostSNI bool) *HandshakeInfo {
+	return &HandshakeInfo{
+		rootProvider:        rootProvider,
+		identityProvider:    identityProvider,
+		sanMatchers:         sanMatchers,
+		requireClientCert:   requireClientCert,
+		sni:                 sni,
+		validateSANUsingSNI: validateSANUsingSNI,
+		useAutoHostSNI:      useAutoHostSNI,
+	}
 }
 
 // UseFallbackCreds returns true when fallback credentials are to be used based
@@ -113,24 +140,24 @@ func (hi *HandshakeInfo) UseFallbackCreds() bool {
 	if hi == nil {
 		return true
 	}
-
-	hi.mu.Lock()
-	defer hi.mu.Unlock()
 	return hi.identityProvider == nil && hi.rootProvider == nil
 }
 
 // GetSANMatchersForTesting returns the SAN matchers stored in HandshakeInfo.
 // To be used only for testing purposes.
 func (hi *HandshakeInfo) GetSANMatchersForTesting() []matcher.StringMatcher {
-	hi.mu.Lock()
-	defer hi.mu.Unlock()
 	return append([]matcher.StringMatcher{}, hi.sanMatchers...)
 }
 
 // ClientSideTLSConfig constructs a tls.Config to be used in a client-side
 // handshake based on the contents of the HandshakeInfo.
-func (hi *HandshakeInfo) ClientSideTLSConfig(ctx context.Context) (*tls.Config, error) {
-	hi.mu.Lock()
+//
+// hostname is passed as a parameter here instead of being part of the
+// HandshakeInfo because HandshakeInfo contains cluster-level security
+// configuration that applies to all endpoints in the cluster, while hostname is
+// specific to each endpoint. This allows sharing a single HandshakeInfo
+// instance across multiple endpoints in the same cluster.
+func (hi *HandshakeInfo) ClientSideTLSConfig(ctx context.Context, hostname string) (*tls.Config, error) {
 	// On the client side, rootProvider is mandatory. IdentityProvider is
 	// optional based on whether the client is doing TLS or mTLS.
 	if hi.rootProvider == nil {
@@ -139,7 +166,6 @@ func (hi *HandshakeInfo) ClientSideTLSConfig(ctx context.Context) (*tls.Config, 
 	// Since the call to KeyMaterial() can block, we read the providers under
 	// the lock but call the actual function after releasing the lock.
 	rootProv, idProv := hi.rootProvider, hi.identityProvider
-	hi.mu.Unlock()
 
 	// InsecureSkipVerify needs to be set to true because we need to perform
 	// custom verification to check the SAN on the received certificate.
@@ -157,6 +183,17 @@ func (hi *HandshakeInfo) ClientSideTLSConfig(ctx context.Context) (*tls.Config, 
 	}
 	cfg.RootCAs = km.Roots
 
+	// If AutoHostSNI is true, and the endpoint hostname is present, we use the
+	// endpoint hostname as the SNI value and also for SAN validation.
+	// Otherwise, we use the SNI value from HandshakeInfo (which is configured
+	// by the control plane) and validating SANs based on that.
+	sni := hi.sni
+	if hi.useAutoHostSNI && hostname != "" {
+		sni = hostname
+	}
+
+	cfg.VerifyPeerCertificate = hi.buildVerifyFunc(km, true, sni)
+
 	if idProv != nil {
 		km, err := idProv.KeyMaterial(ctx)
 		if err != nil {
@@ -164,7 +201,82 @@ func (hi *HandshakeInfo) ClientSideTLSConfig(ctx context.Context) (*tls.Config, 
 		}
 		cfg.Certificates = km.Certs
 	}
+
+	if envconfig.XDSSNIEnabled && sni != "" {
+		cfg.ServerName = sni
+	}
 	return cfg, nil
+}
+
+func (hi *HandshakeInfo) buildVerifyFunc(km *certprovider.KeyMaterial, isClient bool, sni string) func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return fmt.Errorf("xds: no peer certificates presented")
+		}
+		// Parse all raw certificates presented by the peer.
+		var certs []*x509.Certificate
+		for _, rc := range rawCerts {
+			cert, err := x509.ParseCertificate(rc)
+			if err != nil {
+				return err
+			}
+			certs = append(certs, cert)
+		}
+
+		// Build the intermediates list and verify that the leaf certificate is
+		// signed by one of the root certificates. If a SPIFFE Bundle Map is
+		// configured, it is used to get the root certs. Otherwise, the
+		// configured roots in the root provider are used.
+		intermediates := x509.NewCertPool()
+		for _, cert := range certs[1:] {
+			intermediates.AddCert(cert)
+		}
+		roots := km.Roots
+		// If a SPIFFE Bundle Map is configured, find the roots for the trust
+		// domain of the leaf certificate.
+		if km.SPIFFEBundleMap != nil {
+			var err error
+			roots, err = spiffe.GetRootsFromSPIFFEBundleMap(km.SPIFFEBundleMap, certs[0])
+			if err != nil {
+				return err
+			}
+		}
+		opts := x509.VerifyOptions{
+			Roots:         roots,
+			Intermediates: intermediates,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		}
+		if isClient {
+			opts.KeyUsages = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+		} else {
+			opts.KeyUsages = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+		}
+		if _, err := certs[0].Verify(opts); err != nil {
+			return err
+		}
+
+		// If XDSSNIEnabled and AutoSNISANValidation are both true and the SNI is
+		// non-empty, validate only DNS SANs against the SNI. Otherwise, fallback to
+		// validating all received SANs against the control plane provided SAN
+		// matchers.
+		if envconfig.XDSSNIEnabled && hi.validateSANUsingSNI && sni != "" {
+			// Verify SAN of leaf certificate with SNI using exact DNS matcher.
+			for _, san := range certs[0].DNSNames {
+				if dnsMatch(sni, san) {
+					return nil
+				}
+			}
+			return fmt.Errorf("xds: received DNS SANs: %v do not match the SNI: %s", certs[0].DNSNames, sni)
+		}
+		// The SANs sent by the xDS control plane are encoded as SPIFFE IDs. We need to
+		// only look at the SANs on the leaf cert.
+		if cert := certs[0]; !hi.MatchingSANExists(cert) {
+			// TODO: Print the complete certificate once the x509 package
+			// supports a String() method on the Certificate type.
+			return fmt.Errorf("xds: received SANs {DNSNames: %v, EmailAddresses: %v, IPAddresses: %v, URIs: %v} do not match any of the accepted SANs", cert.DNSNames, cert.EmailAddresses, cert.IPAddresses, cert.URIs)
+		}
+		return nil
+	}
 }
 
 // ServerSideTLSConfig constructs a tls.Config to be used in a server-side
@@ -174,7 +286,6 @@ func (hi *HandshakeInfo) ServerSideTLSConfig(ctx context.Context) (*tls.Config, 
 		ClientAuth: tls.NoClientCert,
 		NextProtos: []string{"h2"},
 	}
-	hi.mu.Lock()
 	// On the server side, identityProvider is mandatory. RootProvider is
 	// optional based on whether the server is doing TLS or mTLS.
 	if hi.identityProvider == nil {
@@ -186,7 +297,6 @@ func (hi *HandshakeInfo) ServerSideTLSConfig(ctx context.Context) (*tls.Config, 
 	if hi.requireClientCert {
 		cfg.ClientAuth = tls.RequireAndVerifyClientCert
 	}
-	hi.mu.Unlock()
 
 	// identityProvider is mandatory on the server side.
 	km, err := idProv.KeyMaterial(ctx)
@@ -200,7 +310,15 @@ func (hi *HandshakeInfo) ServerSideTLSConfig(ctx context.Context) (*tls.Config, 
 		if err != nil {
 			return nil, fmt.Errorf("xds: fetching trusted roots from CertificateProvider failed: %v", err)
 		}
-		cfg.ClientCAs = km.Roots
+		if km.SPIFFEBundleMap != nil && hi.requireClientCert {
+			// ClientAuth, if set greater than tls.RequireAnyClientCert, must be
+			// dropped to tls.RequireAnyClientCert so that custom verification
+			// to use SPIFFE Bundles is done.
+			cfg.ClientAuth = tls.RequireAnyClientCert
+			cfg.VerifyPeerCertificate = hi.buildVerifyFunc(km, false, "")
+		} else {
+			cfg.ClientCAs = km.Roots
+		}
 	}
 	return cfg, nil
 }
@@ -211,8 +329,6 @@ func (hi *HandshakeInfo) ServerSideTLSConfig(ctx context.Context) (*tls.Config, 
 // If the list of SAN matchers in the HandshakeInfo is empty, this function
 // returns true for all input certificates.
 func (hi *HandshakeInfo) MatchingSANExists(cert *x509.Certificate) bool {
-	hi.mu.Lock()
-	defer hi.mu.Unlock()
 	if len(hi.sanMatchers) == 0 {
 		return true
 	}
@@ -310,10 +426,4 @@ func dnsMatch(host, san string) bool {
 	// that the '*' does not match across domain components.
 	hostPrefix := strings.TrimSuffix(host, san[1:])
 	return !strings.Contains(hostPrefix, ".")
-}
-
-// NewHandshakeInfo returns a new instance of HandshakeInfo with the given root
-// and identity certificate providers.
-func NewHandshakeInfo(root, identity certprovider.Provider) *HandshakeInfo {
-	return &HandshakeInfo{rootProvider: root, identityProvider: identity}
 }
