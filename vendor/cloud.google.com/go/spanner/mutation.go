@@ -17,11 +17,13 @@ limitations under the License.
 package spanner
 
 import (
+	"fmt"
+	"math/rand"
 	"reflect"
 
-	proto3 "github.com/golang/protobuf/ptypes/struct"
-	sppb "google.golang.org/genproto/googleapis/spanner/v1"
+	sppb "cloud.google.com/go/spanner/apiv1/spannerpb"
 	"google.golang.org/grpc/codes"
+	proto3 "google.golang.org/protobuf/types/known/structpb"
 )
 
 // op is the mutation operation.
@@ -69,7 +71,7 @@ const (
 // To apply a series of mutations as part of an atomic read-modify-write
 // operation, use ReadWriteTransaction.
 //
-// Updating a row
+// # Updating a row
 //
 // Changing the values of columns in an existing row is very similar to
 // inserting a new row:
@@ -79,7 +81,7 @@ const (
 //		[]interface{}{UserID, profile})
 //	_, err := client.Apply(ctx, []*spanner.Mutation{m})
 //
-// Deleting a row
+// # Deleting a row
 //
 // To delete a row, use spanner.Delete:
 //
@@ -93,7 +95,7 @@ const (
 // if cascading deletes are specified in those tables' schemas. Delete does
 // nothing if the named row does not exist (does not yield an error).
 //
-// Deleting a field
+// # Deleting a field
 //
 // To delete/clear a field within a row, use spanner.Update with the value nil:
 //
@@ -105,22 +107,22 @@ const (
 // The valid Go types and their corresponding Cloud Spanner types that can be
 // used in the Insert/Update/InsertOrUpdate functions are:
 //
-//     string, *string, NullString - STRING
-//     []string, []*string, []NullString - STRING ARRAY
-//     []byte - BYTES
-//     [][]byte - BYTES ARRAY
-//     int, int64, *int64, NullInt64 - INT64
-//     []int, []int64, []*int64, []NullInt64 - INT64 ARRAY
-//     bool, *bool, NullBool - BOOL
-//     []bool, []*bool, []NullBool - BOOL ARRAY
-//     float64, *float64, NullFloat64 - FLOAT64
-//     []float64, []*float64, []NullFloat64 - FLOAT64 ARRAY
-//     time.Time, *time.Time, NullTime - TIMESTAMP
-//     []time.Time, []*time.Time, []NullTime - TIMESTAMP ARRAY
-//     Date, *Date, NullDate - DATE
-//     []Date, []*Date, []NullDate - DATE ARRAY
-//     big.Rat, *big.Rat, NullNumeric - NUMERIC
-//     []big.Rat, []*big.Rat, []NullNumeric - NUMERIC ARRAY
+//	string, *string, NullString - STRING
+//	[]string, []*string, []NullString - STRING ARRAY
+//	[]byte - BYTES
+//	[][]byte - BYTES ARRAY
+//	int, int64, *int64, NullInt64 - INT64
+//	[]int, []int64, []*int64, []NullInt64 - INT64 ARRAY
+//	bool, *bool, NullBool - BOOL
+//	[]bool, []*bool, []NullBool - BOOL ARRAY
+//	float64, *float64, NullFloat64 - FLOAT64
+//	[]float64, []*float64, []NullFloat64 - FLOAT64 ARRAY
+//	time.Time, *time.Time, NullTime - TIMESTAMP
+//	[]time.Time, []*time.Time, []NullTime - TIMESTAMP ARRAY
+//	Date, *Date, NullDate - DATE
+//	[]Date, []*Date, []NullDate - DATE ARRAY
+//	big.Rat, *big.Rat, NullNumeric - NUMERIC
+//	[]big.Rat, []*big.Rat, []NullNumeric - NUMERIC ARRAY
 //
 // To compare two Mutations for testing purposes, use reflect.DeepEqual.
 type Mutation struct {
@@ -139,6 +141,16 @@ type Mutation struct {
 	// values specifies the new values for the target columns
 	// named by Columns.
 	values []interface{}
+
+	// wrapped is the protobuf mutation that is the source for this Mutation.
+	// This is only set if the [WrapMutation] function was used to create the Mutation.
+	wrapped *sppb.Mutation
+}
+
+// A MutationGroup is a list of Mutation to be committed atomically.
+type MutationGroup struct {
+	// The Mutations in this group
+	Mutations []*Mutation
 }
 
 // mapToMutationParams converts Go map into mutation parameters.
@@ -186,6 +198,11 @@ func structToMutationParams(in interface{}) ([]string, []interface{}, error) {
 	var cols []string
 	var vals []interface{}
 	for _, f := range fields {
+		if f.ParsedTag != nil {
+			if tag, ok := f.ParsedTag.(spannerTag); ok && tag.ReadOnly {
+				continue
+			}
+		}
 		cols = append(cols, f.Name)
 		vals = append(vals, v.FieldByIndex(f.Index).Interface())
 	}
@@ -348,6 +365,37 @@ func Delete(table string, ks KeySet) *Mutation {
 	}
 }
 
+// WrapMutation creates a mutation that wraps an existing protobuf mutation object.
+func WrapMutation(proto *sppb.Mutation) (*Mutation, error) {
+	if proto == nil {
+		return nil, fmt.Errorf("protobuf mutation may not be nil")
+	}
+	op, table, err := getTableAndSpannerOperation(proto)
+	if err != nil {
+		return nil, err
+	}
+	return &Mutation{
+		op:      op,
+		table:   table,
+		wrapped: proto,
+	}, nil
+}
+
+func getTableAndSpannerOperation(proto *sppb.Mutation) (op, string, error) {
+	if proto.GetInsert() != nil {
+		return opInsert, proto.GetInsert().Table, nil
+	} else if proto.GetUpdate() != nil {
+		return opUpdate, proto.GetUpdate().Table, nil
+	} else if proto.GetReplace() != nil {
+		return opReplace, proto.GetReplace().Table, nil
+	} else if proto.GetDelete() != nil {
+		return opDelete, proto.GetDelete().Table, nil
+	} else if proto.GetInsertOrUpdate() != nil {
+		return opInsertOrUpdate, proto.GetInsertOrUpdate().Table, nil
+	}
+	return 0, "", spannerErrorf(codes.InvalidArgument, "unknown op type: %d", proto.Operation)
+}
+
 // prepareWrite generates sppb.Mutation_Write from table name, column names
 // and new column values.
 func prepareWrite(table string, columns []string, vals []interface{}) (*sppb.Mutation_Write, error) {
@@ -367,9 +415,13 @@ func errInvdMutationOp(m Mutation) error {
 	return spannerErrorf(codes.InvalidArgument, "Unknown op type: %d", m.op)
 }
 
-// proto converts spanner.Mutation to sppb.Mutation, in preparation to send
+// proto converts a spanner.Mutation to sppb.Mutation, in preparation to send
 // RPCs.
 func (m Mutation) proto() (*sppb.Mutation, error) {
+	if m.wrapped != nil {
+		return m.wrapped, nil
+	}
+
 	var pb *sppb.Mutation
 	switch m.op {
 	case opDelete:
@@ -421,14 +473,52 @@ func (m Mutation) proto() (*sppb.Mutation, error) {
 
 // mutationsProto turns a spanner.Mutation array into a sppb.Mutation array,
 // it is convenient for sending batch mutations to Cloud Spanner.
-func mutationsProto(ms []*Mutation) ([]*sppb.Mutation, error) {
-	l := make([]*sppb.Mutation, 0, len(ms))
-	for _, m := range ms {
+func mutationsProto(ms []*Mutation) ([]*sppb.Mutation, *sppb.Mutation, error) {
+	n := len(ms)
+	out := make([]*sppb.Mutation, 0, n)
+	if n == 0 {
+		return out, nil, nil
+	}
+	maxInsertIdx := -1
+	maxInsertVals := -1
+	nonInsertCount := 0
+	selectedNonInsertIdx := -1
+	for i, m := range ms {
 		pb, err := m.proto()
+		if err != nil {
+			return nil, nil, err
+		}
+		out = append(out, pb)
+		if m.op == opInsert {
+			if v := len(m.values); v >= maxInsertVals {
+				maxInsertVals, maxInsertIdx = v, i
+			}
+			continue
+		}
+		nonInsertCount++
+		if rand.Intn(nonInsertCount) == 0 {
+			selectedNonInsertIdx = i
+		}
+	}
+	if nonInsertCount > 0 {
+		return out, out[selectedNonInsertIdx], nil
+	}
+	if maxInsertIdx >= 0 {
+		return out, out[maxInsertIdx], nil
+	}
+	return out, nil, nil
+}
+
+// mutationGroupsProto turns a spanner.MutationGroup array into a
+// sppb.BatchWriteRequest_MutationGroup array, in preparation to send RPCs.
+func mutationGroupsProto(mgs []*MutationGroup) ([]*sppb.BatchWriteRequest_MutationGroup, error) {
+	gs := make([]*sppb.BatchWriteRequest_MutationGroup, 0, len(mgs))
+	for _, mg := range mgs {
+		ms, _, err := mutationsProto(mg.Mutations)
 		if err != nil {
 			return nil, err
 		}
-		l = append(l, pb)
+		gs = append(gs, &sppb.BatchWriteRequest_MutationGroup{Mutations: ms})
 	}
-	return l, nil
+	return gs, nil
 }
